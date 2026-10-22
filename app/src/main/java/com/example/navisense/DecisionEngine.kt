@@ -1,0 +1,293 @@
+package com.example.navisense
+
+import android.util.Log
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+
+/**
+ * Tracks the last announced alert timestamp and distance for cooldown evaluation.
+ */
+data class LastAlertRecord(
+    val timestamp: Long,
+    val distanceMeters: Float
+)
+
+/**
+ * Evaluates object detections with temporal tracking:
+ * - Requires 3 consecutive frames before triggering obstacle alerts
+ * - Filters by class-specific score thresholds (0.6 for vehicles, 0.5 for others)
+ * - Enforces median distance smoothing over last 5 frames
+ * - Performs sanity checks (large box / extreme vehicle aspect ratio -> "Large obstacle ahead", no urgent interrupt)
+ * - Prevents dual vibration collision: only one vibration source active per frame
+ * - Enforces cooldowns and synchronized speech / haptics.
+ */
+class DecisionEngine(
+    private val voiceManager: VoiceNotifier,
+    private val hapticManager: HapticNotifier,
+    val tracker: ObstacleTracker = ObstacleTracker(),
+    private val timeProvider: () -> Long = { System.currentTimeMillis() }
+) {
+
+    var isVoiceEnabled: Boolean = true
+        set(value) {
+            field = value
+            Log.i(TAG, "DecisionEngine isVoiceEnabled set to: $value")
+            if (!value) {
+                voiceManager.stop()
+            }
+        }
+
+    var isHapticsEnabled: Boolean = true
+        set(value) {
+            field = value
+            Log.i(TAG, "DecisionEngine isHapticsEnabled set to: $value")
+            hapticManager.isEnabled = value
+            if (!value) {
+                hapticManager.cancel()
+            }
+        }
+
+    var isEnabled: Boolean
+        get() = isVoiceEnabled || isHapticsEnabled
+        set(value) {
+            isVoiceEnabled = value
+            isHapticsEnabled = value
+        }
+
+    // Tracks cooldown per (label, zone) -> last spoken timestamp & distance
+    private val lastAlertMap = ConcurrentHashMap<Pair<String, Zone>, LastAlertRecord>()
+
+    fun processDetections(
+        detections: List<Detection>,
+        frameWidthPx: Int = 0,
+        frameHeightPx: Int = 0
+    ) {
+        if (!isEnabled) {
+            tracker.clear()
+            hapticManager.clearContinuousCenterObstacle()
+            return
+        }
+
+        if (detections.isEmpty()) {
+            tracker.update(emptyList(), frameWidthPx, frameHeightPx)
+            hapticManager.clearContinuousCenterObstacle()
+            return
+        }
+
+        // 1. Update ObstacleTracker (Requirement 1, 2, 3, 4)
+        val trackedObstacles = tracker.update(detections, frameWidthPx, frameHeightPx)
+
+        // 2. Filter whitelisted & alert-eligible obstacles (3 consecutive frames, distance <= 5m)
+        val validObstacles = trackedObstacles.filter { tracked ->
+            val normalizedLabel = tracked.label.trim().lowercase(Locale.US)
+            val isWhitelisted = normalizedLabel in OBSTACLE_WHITELIST
+            val inRange = tracked.smoothedDistanceMeters > 0f && tracked.smoothedDistanceMeters <= MAX_DETECTION_DISTANCE_METERS
+            val isEligible = tracked.isAlertEligible // consecutiveFrames >= 3
+
+            if (!isWhitelisted) {
+                Log.d(TAG, "Ignoring non-whitelisted detection: '${tracked.label}'")
+            } else if (!inRange) {
+                Log.d(TAG, "Ignoring detection beyond 5m: '${tracked.label}' at ${tracked.smoothedDistanceMeters}m")
+            } else if (!isEligible) {
+                Log.d(TAG, "Obstacle '${tracked.label}' at frame ${tracked.consecutiveFrames}/3; waiting for 3 consecutive frames.")
+            }
+
+            isWhitelisted && inRange && isEligible
+        }
+
+        if (validObstacles.isEmpty()) {
+            hapticManager.clearContinuousCenterObstacle()
+            return
+        }
+
+        // 3. Rank detections by danger score: closer = higher danger, CENTER weighted higher
+        val ranked = validObstacles.sortedByDescending { calculateDangerScore(it) }
+        val topCandidates = ranked.take(2)
+        val now = timeProvider()
+        var oneShotHapticFired = false
+
+        for (obstacle in topCandidates) {
+            val key = Pair(obstacle.label.trim().lowercase(Locale.US), obstacle.zone)
+            val lastRecord = lastAlertMap[key]
+
+            // Cooldown rule: repeat same (label, zone) only if distance changed by >= 1m, or after 8s
+            val shouldAnnounce = if (lastRecord == null) {
+                true
+            } else {
+                val distanceDiff = kotlin.math.abs(obstacle.smoothedDistanceMeters - lastRecord.distanceMeters)
+                val elapsed = now - lastRecord.timestamp
+                val distanceChanged = distanceDiff >= DISTANCE_CHANGE_THRESHOLD_METERS
+                val cooldownExpired = elapsed >= COOLDOWN_MS
+                distanceChanged || cooldownExpired
+            }
+
+            if (shouldAnnounce) {
+                // If box is unreliable or large vehicle, do NOT trigger urgent interrupt.
+                // For people, animals, furniture and other whitelisted classes, a box taller than 80%
+                // of the frame height means the object is very close, so keep the urgent alert (interrupt = true)
+                // and the critical haptic pattern.
+                val isVehicle = obstacle.label.trim().lowercase(Locale.US) in ObstacleTracker.VEHICLE_CLASSES
+                val isVeryClose = !obstacle.isUnreliableOrLarge && (
+                    obstacle.smoothedDistanceMeters < CRITICAL_DISTANCE_THRESHOLD_METERS || (!isVehicle && obstacle.isLargeBox)
+                )
+                val message = formatMessage(obstacle)
+
+                lastAlertMap[key] = LastAlertRecord(timestamp = now, distanceMeters = obstacle.smoothedDistanceMeters)
+
+                Log.i(
+                    TAG,
+                    "DecisionEngine trigger -> \"$message\" | Zone: ${obstacle.zone} | Dist: ${String.format(Locale.US, "%.2f", obstacle.smoothedDistanceMeters)}m | Voice: $isVoiceEnabled | Haptics: $isHapticsEnabled | VeryClose: $isVeryClose | Unreliable: ${obstacle.isUnreliableOrLarge}"
+                )
+
+                if (isVoiceEnabled) {
+                    voiceManager.speak(message, interrupt = isVeryClose)
+                }
+
+                // Requirement 7: Single vibration source - trigger one-shot alert haptic
+                // For very close non-vehicles with large boxes, ensure critical haptic pattern (< 1.5m)
+                if (isHapticsEnabled && !oneShotHapticFired) {
+                    val hapticDist = if (!isVehicle && obstacle.isLargeBox) {
+                        obstacle.smoothedDistanceMeters.coerceAtMost(CRITICAL_DISTANCE_THRESHOLD_METERS - 0.1f)
+                    } else {
+                        obstacle.smoothedDistanceMeters
+                    }
+                    hapticManager.vibrateForObstacleAlert(hapticDist, obstacle.zone)
+                    oneShotHapticFired = true
+                }
+
+                if (isVeryClose) break
+            }
+        }
+
+        // 4. Center obstacle cadenced haptics
+        // Requirement 7: Single vibration source - do NOT fire cadence if one-shot alert fired on this frame
+        val closestCenterObstacle = validObstacles
+            .filter { it.zone == Zone.CENTER && (it.smoothedDistanceMeters < CONTINUOUS_HAPTIC_THRESHOLD_METERS || (!it.isUnreliableOrLarge && it.isLargeBox)) }
+            .minByOrNull { it.smoothedDistanceMeters }
+
+        if (closestCenterObstacle != null && isHapticsEnabled) {
+            if (!oneShotHapticFired) {
+                val isVehicle = closestCenterObstacle.label.trim().lowercase(Locale.US) in ObstacleTracker.VEHICLE_CLASSES
+                val hapticDist = if (!isVehicle && closestCenterObstacle.isLargeBox) {
+                    closestCenterObstacle.smoothedDistanceMeters.coerceAtMost(CRITICAL_DISTANCE_THRESHOLD_METERS - 0.1f)
+                } else {
+                    closestCenterObstacle.smoothedDistanceMeters
+                }
+                hapticManager.updateContinuousCenterObstacle(hapticDist)
+            }
+        } else {
+            hapticManager.clearContinuousCenterObstacle()
+        }
+    }
+
+    private fun calculateDangerScore(obstacle: TrackedObstacle): Float {
+        val zoneWeight = if (obstacle.zone == Zone.CENTER) 1.5f else 1.0f
+        return (1f / obstacle.smoothedDistanceMeters.coerceAtLeast(0.3f)) * zoneWeight
+    }
+
+    private fun calculateDangerScore(detection: Detection): Float {
+        val zoneWeight = if (detection.zone == Zone.CENTER) 1.5f else 1.0f
+        return (1f / detection.distanceMeters.coerceAtLeast(0.3f)) * zoneWeight
+    }
+
+    fun formatDistance(meters: Float): String {
+        val rounded = (Math.round(meters * 2f) / 2.0).coerceAtLeast(0.5)
+        val distStr = if (rounded % 1.0 == 0.0) {
+            rounded.toInt().toString()
+        } else {
+            String.format(Locale.US, "%.1f", rounded)
+        }
+        val unit = if (rounded == 1.0) "meter" else "meters"
+        return "$distStr $unit"
+    }
+
+    fun formatMessage(obstacle: TrackedObstacle): String {
+        // Requirement 4: If box is unreliable or large, say "Large obstacle ahead" without a number
+        if (obstacle.isUnreliableOrLarge) {
+            return when (obstacle.zone) {
+                Zone.CENTER -> "Large obstacle ahead"
+                Zone.LEFT -> "Large obstacle on your left"
+                Zone.RIGHT -> "Large obstacle on your right"
+            }
+        }
+
+        val capitalizedLabel = obstacle.label.trim().replaceFirstChar {
+            if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString()
+        }
+        val distanceText = formatDistance(obstacle.smoothedDistanceMeters)
+        return when (obstacle.zone) {
+            Zone.CENTER -> "$capitalizedLabel ahead, $distanceText"
+            Zone.LEFT -> "$capitalizedLabel on your left, $distanceText"
+            Zone.RIGHT -> "$capitalizedLabel on your right, $distanceText"
+        }
+    }
+
+    fun formatMessage(detection: Detection): String {
+        if (detection.isUnreliableOrLarge) {
+            return when (detection.zone) {
+                Zone.CENTER -> "Large obstacle ahead"
+                Zone.LEFT -> "Large obstacle on your left"
+                Zone.RIGHT -> "Large obstacle on your right"
+            }
+        }
+
+        val capitalizedLabel = detection.label.trim().replaceFirstChar {
+            if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString()
+        }
+        val distanceText = formatDistance(detection.distanceMeters)
+        return when (detection.zone) {
+            Zone.CENTER -> "$capitalizedLabel ahead, $distanceText"
+            Zone.LEFT -> "$capitalizedLabel on your left, $distanceText"
+            Zone.RIGHT -> "$capitalizedLabel on your right, $distanceText"
+        }
+    }
+
+    fun clear() {
+        lastAlertMap.clear()
+        tracker.clear()
+        hapticManager.clearContinuousCenterObstacle()
+        hapticManager.cancel()
+        Log.i(TAG, "DecisionEngine alert records and haptics cleared.")
+    }
+
+    companion object {
+        private const val TAG = "DecisionEngine"
+
+        const val MAX_DETECTION_DISTANCE_METERS = 5.0f
+        const val CONTINUOUS_HAPTIC_THRESHOLD_METERS = 3.0f
+        const val CRITICAL_DISTANCE_THRESHOLD_METERS = 1.5f
+
+        const val COOLDOWN_MS = 8000L
+        const val DISTANCE_CHANGE_THRESHOLD_METERS = 1.0f
+
+        val OBSTACLE_WHITELIST = setOf(
+            "person",
+            "bicycle",
+            "car",
+            "motorcycle",
+            "bus",
+            "truck",
+            "dog",
+            "cat",
+            "cow",
+            "horse",
+            "chair",
+            "couch",
+            "sofa",
+            "bench",
+            "bed",
+            "dining table",
+            "table",
+            "potted plant",
+            "pottedplant",
+            "plant",
+            "door",
+            "suitcase",
+            "backpack",
+            "bottle",
+            "fire hydrant",
+            "stop sign",
+            "traffic light"
+        )
+    }
+}

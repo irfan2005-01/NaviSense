@@ -20,6 +20,18 @@ import java.util.concurrent.Executors
 class CameraManager(private val context: Context) {
 
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    var frameAnalyzer: ((ImageProxy) -> Unit)? = null
+    var isPaused: Boolean = false
+
+    fun pause() {
+        isPaused = true
+        Log.d(TAG, "Camera frame analysis paused.")
+    }
+
+    fun resume() {
+        isPaused = false
+        Log.d(TAG, "Camera frame analysis resumed.")
+    }
 
     fun startCamera(
         lifecycleOwner: LifecycleOwner,
@@ -46,6 +58,10 @@ class CameraManager(private val context: Context) {
                     .build()
                     .also { analysis ->
                         analysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                            if (isPaused) {
+                                imageProxy.close()
+                                return@setAnalyzer
+                            }
                             try {
                                 frameCount++
                                 if (isFirstFrame) {
@@ -66,6 +82,7 @@ class CameraManager(private val context: Context) {
                                     frameCount = 0
                                     lastFpsTimestamp = now
                                 }
+                                frameAnalyzer?.invoke(imageProxy)
                             } catch (e: Exception) {
                                 Log.e(TAG, "Error analyzing image frame", e)
                             } finally {
