@@ -81,12 +81,21 @@ class DecisionEngineTest {
         )
     }
 
+    private fun rectF(left: Float, top: Float, right: Float, bottom: Float): RectF {
+        val r = RectF()
+        r.left = left
+        r.top = top
+        r.right = right
+        r.bottom = bottom
+        return r
+    }
+
     private fun createDetection(
         label: String,
         distanceMeters: Float,
         zone: Zone,
         score: Float = 0.9f,
-        box: RectF = RectF(0f, 0f, 100f, 100f),
+        box: RectF = rectF(0f, 0f, 100f, 100f),
         frameWidth: Int = 1000,
         frameHeight: Int = 1000,
         boxWidth: Float = 100f,
@@ -180,7 +189,7 @@ class DecisionEngineTest {
     @Test
     fun largeBoxRule_vehicleSaysLargeObstacleWithoutNumber_andSuppressesUrgentInterrupt() {
         // Vehicle ("car") taking up 85% of frame height (850px / 1000px) with close distance 1.0m (< 1.5m)
-        val hugeBox = RectF(50f, 50f, 600f, 900f) // height = 850px
+        val hugeBox = rectF(50f, 50f, 600f, 900f) // height = 850px
         val hugeDetection = listOf(
             createDetection("car", 1.0f, Zone.CENTER, score = 0.9f, box = hugeBox, frameHeight = 1000, boxWidth = 550f, boxHeight = 850f)
         )
@@ -189,7 +198,7 @@ class DecisionEngineTest {
 
         assertEquals(1, fakeVoice.spokenMessages.size)
         val speech = fakeVoice.spokenMessages[0]
-        assertEquals("Large obstacle ahead", speech)
+        assertEquals("Large obstacle ahead. Stop.", speech)
         assertFalse("Spoken message must NOT contain a specific distance number", speech.contains("meter") || speech.contains("1"))
         assertFalse("Urgent speech interrupt MUST be suppressed for unreliable large vehicle boxes", fakeVoice.interruptedList[0])
     }
@@ -197,7 +206,7 @@ class DecisionEngineTest {
     @Test
     fun largeBoxRule_nonVehicleKeepsUrgentAlert_andCriticalHaptic_andClampsDistanceTo0_5m() {
         // Non-vehicle ("person") taking up 85% of frame height (850px / 1000px) with raw distance 0.3m (< 0.5m)
-        val hugeBox = RectF(50f, 50f, 600f, 900f) // height = 850px
+        val hugeBox = rectF(50f, 50f, 600f, 900f) // height = 850px
         val personDetection = listOf(
             createDetection("person", 0.3f, Zone.CENTER, score = 0.9f, box = hugeBox, frameHeight = 1000, boxWidth = 550f, boxHeight = 850f)
         )
@@ -206,7 +215,7 @@ class DecisionEngineTest {
 
         assertEquals(1, fakeVoice.spokenMessages.size)
         val speech = fakeVoice.spokenMessages[0]
-        assertEquals("Person ahead, 0.5 meters", speech)
+        assertEquals("Person ahead, 0.5 meters. Step right.", speech)
         assertTrue("Urgent speech interrupt MUST be true for close non-vehicle", fakeVoice.interruptedList[0])
 
         // Verify haptic feedback triggered in critical band (< 1.5m)
@@ -220,7 +229,7 @@ class DecisionEngineTest {
     @Test
     fun largeBoxRule_nonVehicleWith1mDistance_keepsUrgentAlert_andCriticalHaptic() {
         // Non-vehicle ("chair") taking up 85% of frame height with distance 1.0m
-        val hugeBox = RectF(50f, 50f, 600f, 900f)
+        val hugeBox = rectF(50f, 50f, 600f, 900f)
         val chairDetection = listOf(
             createDetection("chair", 1.0f, Zone.CENTER, score = 0.9f, box = hugeBox, frameHeight = 1000, boxWidth = 550f, boxHeight = 850f)
         )
@@ -229,7 +238,7 @@ class DecisionEngineTest {
 
         assertEquals(1, fakeVoice.spokenMessages.size)
         val speech = fakeVoice.spokenMessages[0]
-        assertEquals("Chair ahead, 1 meter", speech)
+        assertEquals("Chair ahead, 1 meter. Step right.", speech)
         assertTrue("Urgent speech interrupt MUST be true for close chair", fakeVoice.interruptedList[0])
         assertEquals(1, fakeHaptics.obstacleAlerts.size)
         val (hapticDist, _) = fakeHaptics.obstacleAlerts[0]
@@ -299,6 +308,37 @@ class DecisionEngineTest {
     }
 
     @Test
+    fun sideObstaclesProduceNoVibration_voiceOnly() {
+        // LEFT obstacle: speaks message, but produces NO vibration
+        engine.clear()
+        fakeVoice.clear()
+        fakeHaptics.clearHistory()
+        feedFrames(listOf(createDetection("person", 2.0f, Zone.LEFT)), count = 3)
+        assertEquals("LEFT obstacle must trigger spoken voice cue", 1, fakeVoice.spokenMessages.size)
+        assertTrue(fakeVoice.spokenMessages[0].contains("left"))
+        assertEquals("LEFT obstacle must NOT trigger any haptic alert", 0, fakeHaptics.obstacleAlerts.size)
+        assertEquals("Continuous center haptic must be null for side obstacle", null, fakeHaptics.continuousCenterDistance)
+
+        // RIGHT obstacle: speaks message, but produces NO vibration
+        engine.clear()
+        fakeVoice.clear()
+        fakeHaptics.clearHistory()
+        feedFrames(listOf(createDetection("person", 2.0f, Zone.RIGHT)), count = 3)
+        assertEquals("RIGHT obstacle must trigger spoken voice cue", 1, fakeVoice.spokenMessages.size)
+        assertTrue(fakeVoice.spokenMessages[0].contains("right"))
+        assertEquals("RIGHT obstacle must NOT trigger any haptic alert", 0, fakeHaptics.obstacleAlerts.size)
+        assertEquals("Continuous center haptic must be null for side obstacle", null, fakeHaptics.continuousCenterDistance)
+
+        // CENTER obstacle: triggers both voice and vibration
+        engine.clear()
+        fakeVoice.clear()
+        fakeHaptics.clearHistory()
+        feedFrames(listOf(createDetection("person", 2.0f, Zone.CENTER)), count = 3)
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("CENTER obstacle <= 3m MUST trigger haptic alert", 1, fakeHaptics.obstacleAlerts.size)
+    }
+
+    @Test
     fun settingsToggles_voiceAndHapticsSeparately() {
         // Voice OFF, Haptics ON
         engine.isVoiceEnabled = false
@@ -306,7 +346,7 @@ class DecisionEngineTest {
         fakeVoice.clear()
         fakeHaptics.clearHistory()
 
-        feedFrames(listOf(createDetection("bicycle", 2.0f, Zone.LEFT)), count = 3)
+        feedFrames(listOf(createDetection("bicycle", 2.0f, Zone.CENTER)), count = 3)
         assertEquals(0, fakeVoice.spokenMessages.size)
         assertEquals(1, fakeHaptics.obstacleAlerts.size)
 
@@ -317,7 +357,7 @@ class DecisionEngineTest {
         fakeVoice.clear()
         fakeHaptics.clearHistory()
 
-        feedFrames(listOf(createDetection("bicycle", 2.0f, Zone.LEFT)), count = 3)
+        feedFrames(listOf(createDetection("bicycle", 2.0f, Zone.CENTER)), count = 3)
         assertEquals(1, fakeVoice.spokenMessages.size)
         assertEquals(0, fakeHaptics.obstacleAlerts.size)
 
@@ -328,8 +368,337 @@ class DecisionEngineTest {
         fakeVoice.clear()
         fakeHaptics.clearHistory()
 
-        feedFrames(listOf(createDetection("bicycle", 2.0f, Zone.LEFT)), count = 3)
+        feedFrames(listOf(createDetection("bicycle", 2.0f, Zone.CENTER)), count = 3)
         assertEquals(0, fakeVoice.spokenMessages.size)
         assertEquals(0, fakeHaptics.obstacleAlerts.size)
+    }
+
+    // ==========================================
+    // Step 10: Avoidance Guidance Unit Tests
+    // ==========================================
+
+    @Test
+    fun avoidance_leftClear_saysStepLeft() {
+        // Frame width 1000px. Left third: 0..333, Center: 333..666, Right: 666..1000.
+        // Center obstacle box: left=300, right=850 (center = 575 in CENTER)
+        // freeWidthLeft = 300 >= 250 (clear)
+        // freeWidthRight = 1000 - 850 = 150 < 250 (not clear)
+        val centerObstacle = listOf(
+            createDetection(
+                label = "person",
+                distanceMeters = 2.0f,
+                zone = Zone.CENTER,
+                box = rectF(300f, 100f, 850f, 800f),
+                frameWidth = 1000,
+                frameHeight = 1000,
+                boxWidth = 550f,
+                boxHeight = 700f
+            )
+        )
+
+        feedFrames(centerObstacle, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2 meters. Step left.", fakeVoice.spokenMessages[0])
+    }
+
+    @Test
+    fun avoidance_rightClear_saysStepRight() {
+        // Center obstacle box: left=150, right=700 (center = 425 in CENTER)
+        // freeWidthLeft = 150 < 250 (not clear)
+        // freeWidthRight = 1000 - 700 = 300 >= 250 (clear)
+        val centerObstacle = listOf(
+            createDetection(
+                label = "person",
+                distanceMeters = 2.0f,
+                zone = Zone.CENTER,
+                box = rectF(150f, 100f, 700f, 800f),
+                frameWidth = 1000,
+                frameHeight = 1000,
+                boxWidth = 550f,
+                boxHeight = 700f
+            )
+        )
+
+        feedFrames(centerObstacle, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2 meters. Step right.", fakeVoice.spokenMessages[0])
+    }
+
+    @Test
+    fun avoidance_bothClear_moreWidthWins() {
+        // 1. Left has more free width (380px vs 280px)
+        val leftWider = listOf(
+            createDetection(
+                label = "person",
+                distanceMeters = 2.0f,
+                zone = Zone.CENTER,
+                box = rectF(380f, 100f, 720f, 800f),
+                frameWidth = 1000,
+                frameHeight = 1000,
+                boxWidth = 340f,
+                boxHeight = 700f
+            )
+        )
+
+        feedFrames(leftWider, count = 3, frameWidth = 1000, frameHeight = 1000)
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2 meters. Step left.", fakeVoice.spokenMessages[0])
+
+        // 2. Right has more free width (380px vs 280px)
+        engine.clear()
+        fakeVoice.clear()
+        fakeHaptics.clearHistory()
+
+        val rightWider = listOf(
+            createDetection(
+                label = "person",
+                distanceMeters = 2.0f,
+                zone = Zone.CENTER,
+                box = rectF(280f, 100f, 620f, 800f),
+                frameWidth = 1000,
+                frameHeight = 1000,
+                boxWidth = 340f,
+                boxHeight = 700f
+            )
+        )
+
+        feedFrames(rightWider, count = 3, frameWidth = 1000, frameHeight = 1000)
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2 meters. Step right.", fakeVoice.spokenMessages[0])
+    }
+
+    @Test
+    fun avoidance_neitherClear_saysStop() {
+        // Center obstacle taking wide central space:
+        // left = 200, right = 800 (freeWidthLeft = 200 < 250, freeWidthRight = 200 < 250)
+        val wideObstacle = listOf(
+            createDetection(
+                label = "person",
+                distanceMeters = 2.0f,
+                zone = Zone.CENTER,
+                box = rectF(200f, 100f, 800f, 800f),
+                frameWidth = 1000,
+                frameHeight = 1000,
+                boxWidth = 600f,
+                boxHeight = 700f
+            )
+        )
+
+        feedFrames(wideObstacle, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2 meters. Stop.", fakeVoice.spokenMessages[0])
+    }
+
+    @Test
+    fun avoidance_anotherObstacleBlockingOneSide_choosesClearSide() {
+        // Center obstacle has left=380 (width=380 >= 250) and right=720 (width=280 >= 250).
+        // Left would normally win (380 > 280).
+        // Another obstacle (chair at 2.0m <= 5m) is in LEFT zone: left=50, right=250 (center=150 in LEFT).
+        val obstacles = listOf(
+            createDetection(
+                label = "person",
+                distanceMeters = 2.0f,
+                zone = Zone.CENTER,
+                box = rectF(380f, 100f, 720f, 800f),
+                frameWidth = 1000,
+                frameHeight = 1000
+            ),
+            createDetection(
+                label = "chair",
+                distanceMeters = 2.0f,
+                zone = Zone.LEFT,
+                box = rectF(50f, 100f, 250f, 400f),
+                frameWidth = 1000,
+                frameHeight = 1000
+            )
+        )
+
+        feedFrames(obstacles, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(2, fakeVoice.spokenMessages.size)
+        // Because left is blocked by the chair, user is advised to step right
+        assertEquals("Person ahead, 2 meters. Step right.", fakeVoice.spokenMessages[0])
+    }
+
+    @Test
+    fun avoidance_anotherObstacleOverlapMoreThan30Percent_blocksSide() {
+        // Center obstacle has left=380 (width 380) vs right=720 (width 280).
+        // Another obstacle in CENTER zone (centerX = 350 > 333.3), but overlaps LEFT third [0, 333.3] from 200 to 333.3:
+        // overlap = 133.3px / 333.3px = 40% > 30%.
+        val obstacles = listOf(
+            createDetection(
+                label = "person",
+                distanceMeters = 2.0f,
+                zone = Zone.CENTER,
+                box = rectF(380f, 100f, 720f, 800f),
+                frameWidth = 1000,
+                frameHeight = 1000
+            ),
+            createDetection(
+                label = "chair",
+                distanceMeters = 2.5f,
+                zone = Zone.CENTER,
+                box = rectF(200f, 100f, 500f, 400f),
+                frameWidth = 1000,
+                frameHeight = 1000
+            )
+        )
+
+        feedFrames(obstacles, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(2, fakeVoice.spokenMessages.size)
+        // Left blocked by 40% overlap -> Step right
+        assertEquals("Person ahead, 2 meters. Step right.", fakeVoice.spokenMessages[0])
+    }
+
+    @Test
+    fun avoidance_anotherObstacleFartherThan5Meters_doesNotBlockSide() {
+        // Center obstacle has left=380 (width 380) vs right=720 (width 280).
+        // Another obstacle in LEFT zone at 5.5m (> 5m). It should NOT block left.
+        val obstacles = listOf(
+            createDetection(
+                label = "person",
+                distanceMeters = 2.0f,
+                zone = Zone.CENTER,
+                box = rectF(380f, 100f, 720f, 800f),
+                frameWidth = 1000,
+                frameHeight = 1000
+            ),
+            createDetection(
+                label = "chair",
+                distanceMeters = 5.5f,
+                zone = Zone.LEFT,
+                box = rectF(50f, 100f, 250f, 400f),
+                frameWidth = 1000,
+                frameHeight = 1000
+            )
+        )
+
+        feedFrames(obstacles, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        // Left is clear because 5.5m > 5m, left free width 380 > 280 -> Step left
+        assertEquals("Person ahead, 2 meters. Step left.", fakeVoice.spokenMessages[0])
+    }
+
+    @Test
+    fun avoidance_vehicleLargeBox_saysLargeObstacleAheadStop() {
+        val hugeBox = rectF(50f, 50f, 600f, 900f) // height = 850px in 1000px frame
+        val vehicleDetection = listOf(
+            createDetection("truck", 2.0f, Zone.CENTER, score = 0.9f, box = hugeBox, frameHeight = 1000, boxWidth = 550f, boxHeight = 850f)
+        )
+
+        feedFrames(vehicleDetection, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Large obstacle ahead. Stop.", fakeVoice.spokenMessages[0])
+        assertFalse("Urgent speech interrupt must be suppressed for large vehicle", fakeVoice.interruptedList[0])
+    }
+
+    @Test
+    fun avoidance_repeatRule_repeatsDirectionOnlyWhenAdviceChangesOrFirstAlert() {
+        // Frame 3: person at 2.4m, right clear (freeWidthLeft = 150 < 250, freeWidthRight = 300 >= 250)
+        currentTimeMs = 1000L
+        val detection1 = listOf(
+            createDetection("person", 2.4f, Zone.CENTER, box = rectF(150f, 100f, 700f, 800f))
+        )
+        feedFrames(detection1, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2.5 meters. Step right.", fakeVoice.spokenMessages[0])
+
+        // 1 second later: distance changed by only 0.1m, elapsed 1s < 8s -> suppressed
+        currentTimeMs = 2000L
+        val detection2 = listOf(
+            createDetection("person", 2.3f, Zone.CENTER, box = rectF(150f, 100f, 700f, 800f))
+        )
+        engine.processDetections(detection2, 1000, 1000)
+        assertEquals("Alert suppressed on cooldown", 1, fakeVoice.spokenMessages.size)
+
+        // 9 seconds later (t = 11000ms, elapsed 10s >= 8s): same advice (Step right)
+        // Should repeat alert, but NOT speak direction because advice has not changed!
+        currentTimeMs = 11000L
+        engine.processDetections(detection2, 1000, 1000)
+        assertEquals(2, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2.5 meters", fakeVoice.spokenMessages[1])
+
+        // Later (t = 13000ms): distance changes to 1.3m (diff = 1.0m >= 1.0m) AND obstacle moves so left is clear (Step left)
+        currentTimeMs = 13000L
+        val detection3 = listOf(
+            createDetection("person", 1.3f, Zone.CENTER, box = rectF(300f, 100f, 850f, 800f))
+        )
+        feedFrames(detection3, count = 5, frameWidth = 1000, frameHeight = 1000)
+        assertEquals(3, fakeVoice.spokenMessages.size)
+        // Advice changed to Step left -> direction IS spoken!
+        assertEquals("Person ahead, 1.5 meters. Step left.", fakeVoice.spokenMessages[2])
+    }
+
+    @Test
+    fun avoidance_navigationNearManeuver_stopsWhenAdviceContradictsTurn() {
+        // Navigation active, 5m to a TURN_LEFT maneuver
+        engine.navigationContext = NavigationContext(
+            isNavigating = true,
+            upcomingManeuverType = ManeuverType.TURN_LEFT,
+            distanceToManeuverMeters = 5.0
+        )
+
+        // Center obstacle has right clear (free space advice would be "Step right")
+        val obstacle = listOf(
+            createDetection("person", 2.0f, Zone.CENTER, box = rectF(150f, 100f, 700f, 800f))
+        )
+
+        feedFrames(obstacle, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        // "Step right" contradicts upcoming TURN_LEFT within 10m -> must say "Obstacle ahead, 2 meters. Stop."
+        assertEquals("Obstacle ahead, 2 meters. Stop.", fakeVoice.spokenMessages[0])
+
+        // When maneuver does not contradict (TURN_RIGHT with "Step right"):
+        engine.clear()
+        fakeVoice.clear()
+        engine.navigationContext = NavigationContext(
+            isNavigating = true,
+            upcomingManeuverType = ManeuverType.TURN_RIGHT,
+            distanceToManeuverMeters = 5.0
+        )
+
+        feedFrames(obstacle, count = 3, frameWidth = 1000, frameHeight = 1000)
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2 meters. Step right.", fakeVoice.spokenMessages[0])
+
+        // When maneuver is farther than 10m (15m):
+        engine.clear()
+        fakeVoice.clear()
+        engine.navigationContext = NavigationContext(
+            isNavigating = true,
+            upcomingManeuverType = ManeuverType.TURN_LEFT,
+            distanceToManeuverMeters = 15.0
+        )
+
+        feedFrames(obstacle, count = 3, frameWidth = 1000, frameHeight = 1000)
+        assertEquals(1, fakeVoice.spokenMessages.size)
+        assertEquals("Person ahead, 2 meters. Step right.", fakeVoice.spokenMessages[0])
+    }
+
+    @Test
+    fun avoidance_noVibrationForDirectionAdvice_respectsVoiceSetting() {
+        // Voice OFF, Haptics ON
+        engine.isVoiceEnabled = false
+        engine.isHapticsEnabled = true
+
+        val obstacle = listOf(
+            createDetection("person", 2.0f, Zone.CENTER, box = rectF(300f, 100f, 850f, 800f))
+        )
+
+        feedFrames(obstacle, count = 3, frameWidth = 1000, frameHeight = 1000)
+
+        // No voice messages
+        assertEquals(0, fakeVoice.spokenMessages.size)
+        // Only obstacle proximity vibration, no directional turn vibrations
+        assertEquals(1, fakeHaptics.obstacleAlerts.size)
+        assertEquals(Zone.CENTER, fakeHaptics.obstacleAlerts[0].second)
     }
 }

@@ -8,17 +8,23 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
+import kotlin.math.roundToInt
 
 /**
- * Haptic priority hierarchy to prevent low-priority vibration queueing
- * and prioritize urgent navigation and obstacle warnings.
+ * Haptic priority hierarchy:
+ * Critical obstacle (< 1.5 m) > Navigation cue > Normal obstacle ticks (1.5 m - 3.0 m).
  */
 enum class HapticPriority(val value: Int) {
     NONE(0),
-    INFO(1),       // Obstacles > 3m
-    NAVIGATION(2), // Turn left, turn right, destination reached
-    WARNING(3),    // Obstacles 1.5m - 3m
-    CRITICAL(4)    // Obstacles < 1.5m
+    INFO(1),              // Obstacles > 3m (no vibration) or settings confirmations
+    NORMAL_OBSTACLE(2),   // Obstacles 1.5m - 3m (Far: 2-3m, Near: 1.5-2m)
+    NAVIGATION(3),        // Turn left, turn right, destination reached
+    CRITICAL(4);          // Obstacles < 1.5m (Danger)
+
+    companion object {
+        // Alias for backwards compatibility with earlier components
+        val WARNING = NORMAL_OBSTACLE
+    }
 }
 
 /**
@@ -26,7 +32,7 @@ enum class HapticPriority(val value: Int) {
  */
 enum class ContinuousHapticMode {
     NONE,
-    CENTER_WARNING,   // 1.5m - 3m
+    CENTER_WARNING,   // 1.5m - 3m (Far: 2-3m, Near: 1.5-2m)
     CENTER_CRITICAL   // < 1.5m (with 0.3m hysteresis deadband)
 }
 
@@ -41,6 +47,10 @@ interface HapticNotifier {
     fun vibrateTurnLeft() {}
     fun vibrateTurnRight() {}
     fun vibrateDestinationReached() {}
+    fun vibrateFarObstacle() {}
+    fun vibrateNearObstacle() {}
+    fun vibrateDangerObstacle() {}
+    fun vibrateArrived() { vibrateDestinationReached() }
     fun cancel()
 }
 
@@ -91,8 +101,22 @@ class AndroidVibrationController(
 
 /**
  * Manages tactile vibration patterns using modern Android VibrationEffect and Vibrator APIs.
- * Supports directional pulse cadences (LEFT, CENTER, RIGHT), distance bands,
- * finite cadenced center danger pulses with hysteresis, and navigation cues.
+ * Redesigned haptic language (Step 9):
+ * 1. Obstacle vibration only for CENTER-zone obstacles within 3 m:
+ *    - Encodes proximity like a parking sensor: sequence of identical short crisp ticks (80-100 ms each)
+ *    - Gap shrinks with distance: 2-3 m (~1200 ms gap), 1.5-2 m (~600 ms gap), <1.5 m (~250 ms gap, strongest amplitude)
+ *    - 0.3 m hysteresis around 1.5 m critical threshold
+ *    - LEFT and RIGHT obstacles produce NO vibration (voice only)
+ *    - Stop vibration immediately when no CENTER obstacle remains within 3 m.
+ * 2. Every vibration pause between pulses >= 150 ms so pulses never blur together.
+ * 3. Navigation cues:
+ *    - Turn Left = 2 long pulses (400 ms each, 400 ms gap)
+ *    - Turn Right = 3 long pulses (400 ms each, 400 ms gap)
+ *    - Arrival = 1 very long pulse (1200 ms)
+ * 4. Priority: critical obstacle (< 1.5 m) > navigation cue > normal obstacle ticks.
+ *    Navigation cue briefly pauses obstacle ticks and lets them resume.
+ *    Never overlap two patterns. Never use indefinite looping; enforce maximum single pattern duration.
+ * 5. Vibration strength option (Low, Medium, High) scales amplitudes.
  */
 class HapticManager(
     private val context: Context? = null,
@@ -145,15 +169,28 @@ class HapticManager(
             }
         }
 
-    private var currentPriority: HapticPriority = HapticPriority.NONE
-    private var currentSessionId: Long = 0L
+    var vibrationStrength: VibrationStrength = VibrationStrength.HIGH
+        set(value) {
+            field = value
+            Log.i(TAG, "HapticManager vibrationStrength set to: $value (scale=${value.scaleFactor})")
+        }
+
+    var currentPriority: HapticPriority = HapticPriority.NONE
+        private set
+    var currentSessionId: Long = 0L
+        private set
     var currentContinuousMode: ContinuousHapticMode = ContinuousHapticMode.NONE
         private set
-    private var lastCadenceTriggerTimeMs: Long = 0L
-
-    // Requirement 7: Track active one-shot alert to enforce single vibration source
     var isAlertVibrating: Boolean = false
         private set
+
+    var currentPatternEndTimeMs: Long = 0L
+        private set
+    var isObstacleTicksPaused: Boolean = false
+        private set
+    var activeCenterObstacleDistance: Float? = null
+        private set
+    private var lastCadenceTriggerTimeMs: Long = 0L
 
     init {
         Log.i(
@@ -163,26 +200,30 @@ class HapticManager(
     }
 
     /**
-     * Triggers tactile feedback for an obstacle based on its distance and zone.
-     * Respects directional pulse timing (LEFT: short-short, CENTER: long-short, RIGHT: short-short-short)
-     * and distance bands (>3m: soft short, 1.5-3m: repeated medium, <1.5m: fast strong).
+     * Obstacle alert vibration: ONLY for CENTER-zone obstacles within 3 m.
+     * LEFT and RIGHT obstacles produce NO vibration (voice only).
      */
     override fun vibrateForObstacleAlert(distanceMeters: Float, zone: Zone?) {
         if (!isEnabled || !hasVibrator) return
 
-        val priority = when {
-            distanceMeters < CRITICAL_DISTANCE_METERS -> HapticPriority.CRITICAL
-            distanceMeters <= WARNING_DISTANCE_METERS -> HapticPriority.WARNING
-            else -> HapticPriority.INFO
+        // Requirement 1: Vibration is only for CENTER-zone obstacles within 3 m.
+        // Side obstacles (LEFT and RIGHT) produce no vibration (voice only).
+        if (zone != Zone.CENTER || distanceMeters > WARNING_DISTANCE_METERS) {
+            Log.d(TAG, "Obstacle alert vibration suppressed: zone=$zone, dist=$distanceMeters (only CENTER <= 3m vibrates)")
+            return
         }
 
-        val pattern = buildObstaclePattern(distanceMeters, zone, isContinuous = false)
-        val description = "ObstacleAlert (zone=$zone, dist=${String.format(java.util.Locale.US, "%.1f", distanceMeters)}m)"
+        val isCritical = distanceMeters < CRITICAL_DISTANCE_METERS
+        val priority = if (isCritical) HapticPriority.CRITICAL else HapticPriority.NORMAL_OBSTACLE
 
-        // Requirement 7: Mark one-shot alert active to prevent simultaneous cadence pulse
+        val pattern = buildObstaclePattern(distanceMeters)
+        val description = "ObstacleAlert (dist=${String.format(java.util.Locale.US, "%.1f", distanceMeters)}m)"
+
         isAlertVibrating = true
+        val now = timeProvider()
         val totalDurationMs = pattern.timings.sum()
         val alertSessionId = currentSessionId + 1
+
         handler?.postDelayed({
             if (currentSessionId == alertSessionId) {
                 isAlertVibrating = false
@@ -194,15 +235,15 @@ class HapticManager(
             amplitudes = pattern.amplitudes,
             repeatIndex = -1,
             priority = priority,
-            description = description
+            description = description,
+            currentTimeMs = now
         )
     }
 
     /**
-     * Cadenced vibration while a CENTER obstacle is under 3m.
-     * Requirement 5: Replaces indefinite looping with finite cadenced pulses re-triggered at a minimum interval.
-     * Requirement 6: Hysteresis around the 1.5m critical threshold (0.3m deadband).
-     * Requirement 7: Single vibration source - suppressed if a one-shot alert is currently active.
+     * Cadenced vibration while a CENTER obstacle is under 3 m (parking sensor ticks).
+     * Enforces 0.3 m hysteresis around 1.5 m critical threshold.
+     * Stops immediately when no CENTER obstacle remains within 3 m.
      */
     override fun updateContinuousCenterObstacle(distanceMeters: Float) {
         updateContinuousCenterObstacle(distanceMeters, timeProvider())
@@ -211,36 +252,29 @@ class HapticManager(
     fun updateContinuousCenterObstacle(distanceMeters: Float, currentTimeMs: Long) {
         if (!isEnabled || !hasVibrator) return
 
-        // Requirement 7: Do not trigger continuous cadence while one-shot alert is vibrating
-        if (isAlertVibrating) {
-            Log.d(TAG, "Continuous center cadence suppressed: one-shot alert is currently active.")
-            return
-        }
-
+        // Exceeding 3m: stop vibration immediately
         if (distanceMeters > WARNING_DISTANCE_METERS) {
             clearContinuousCenterObstacle()
             return
         }
 
-        // Requirement 6: Hysteresis around 1.5m threshold (0.3m deadband: [1.5m, 1.8m])
+        // Check if an existing pattern has naturally completed by wall-clock time
+        if (currentTimeMs >= currentPatternEndTimeMs && currentPriority != HapticPriority.NONE) {
+            onPatternCompleted(currentSessionId, currentTimeMs)
+        }
+
+        // Hysteresis around 1.5m threshold (0.3m deadband: [1.5m, 1.8m])
         val targetMode = when (currentContinuousMode) {
             ContinuousHapticMode.CENTER_CRITICAL -> {
-                // To exit CRITICAL mode, distance must exceed 1.8m (1.5m + 0.3m deadband)
+                // Must exceed 1.8m (1.5m + 0.3m deadband) to drop back to WARNING
                 if (distanceMeters >= CRITICAL_EXIT_THRESHOLD_METERS) {
                     ContinuousHapticMode.CENTER_WARNING
                 } else {
                     ContinuousHapticMode.CENTER_CRITICAL
                 }
             }
-            ContinuousHapticMode.CENTER_WARNING -> {
-                // To enter CRITICAL mode, distance must drop below 1.5m
-                if (distanceMeters < CRITICAL_DISTANCE_METERS) {
-                    ContinuousHapticMode.CENTER_CRITICAL
-                } else {
-                    ContinuousHapticMode.CENTER_WARNING
-                }
-            }
-            ContinuousHapticMode.NONE -> {
+            ContinuousHapticMode.CENTER_WARNING, ContinuousHapticMode.NONE -> {
+                // Drops below 1.5m to enter CRITICAL
                 if (distanceMeters < CRITICAL_DISTANCE_METERS) {
                     ContinuousHapticMode.CENTER_CRITICAL
                 } else {
@@ -248,91 +282,168 @@ class HapticManager(
                 }
             }
         }
-
-        currentContinuousMode = targetMode
-
-        // Requirement 5: Re-trigger at minimum interval (800ms) only while condition holds
-        val elapsed = currentTimeMs - lastCadenceTriggerTimeMs
-        if (elapsed < CADENCE_MIN_INTERVAL_MS && lastCadenceTriggerTimeMs > 0L) {
-            return
-        }
-        lastCadenceTriggerTimeMs = currentTimeMs
 
         val targetPriority = if (targetMode == ContinuousHapticMode.CENTER_CRITICAL) {
             HapticPriority.CRITICAL
         } else {
-            HapticPriority.WARNING
+            HapticPriority.NORMAL_OBSTACLE
         }
 
-        val pattern = buildObstaclePattern(distanceMeters, Zone.CENTER, isContinuous = true)
+        val isCurrentlyPlaying = currentTimeMs < currentPatternEndTimeMs
+
+        // Priority and single vibration channel enforcement:
+        if (isCurrentlyPlaying) {
+            // If navigation is currently active:
+            if (currentPriority == HapticPriority.NAVIGATION) {
+                // Critical obstacle (< 1.5 m) > Navigation cue > Normal obstacle
+                if (targetPriority == HapticPriority.CRITICAL) {
+                    Log.i(TAG, "Critical obstacle (<1.5m) preempting active navigation cue.")
+                } else {
+                    // Normal obstacle ticks pause during navigation
+                    activeCenterObstacleDistance = distanceMeters
+                    isObstacleTicksPaused = true
+                    Log.d(TAG, "Obstacle ticks paused during active navigation cue.")
+                    return
+                }
+            } else if (targetPriority.value <= currentPriority.value) {
+                // Do not interrupt same or higher priority pattern while currently vibrating (no overlap)
+                return
+            }
+        }
+
+        currentContinuousMode = targetMode
+        activeCenterObstacleDistance = distanceMeters
+
+        // Throttle interval between cadence pattern repetitions
+        val pattern = buildObstaclePattern(distanceMeters)
+        val patternDuration = pattern.timings.sum()
+        val cadenceInterval = if (targetMode == ContinuousHapticMode.CENTER_CRITICAL) {
+            patternDuration
+        } else if (distanceMeters < 2.0f) {
+            patternDuration
+        } else {
+            patternDuration
+        }
+
+        val elapsed = currentTimeMs - lastCadenceTriggerTimeMs
+        // If mode transitioned to CRITICAL, preempt immediately without waiting for elapsed throttle
+        val isCriticalPreemption = targetPriority == HapticPriority.CRITICAL && currentPriority != HapticPriority.CRITICAL
+        if (!isCriticalPreemption && elapsed < cadenceInterval && lastCadenceTriggerTimeMs > 0L) {
+            return
+        }
+        lastCadenceTriggerTimeMs = currentTimeMs
+
         val desc = "CadencedCenterObstacle (mode=$targetMode, dist=${String.format(java.util.Locale.US, "%.1f", distanceMeters)}m)"
 
-        // Requirement 5: Finite pulse (repeatIndex = -1), never an infinite loop
         playPattern(
             timings = pattern.timings,
             amplitudes = pattern.amplitudes,
             repeatIndex = -1,
             priority = targetPriority,
-            description = desc
+            description = desc,
+            currentTimeMs = currentTimeMs
         )
     }
 
     /**
-     * Clears cadenced CENTER haptics if currently active.
+     * Clears cadenced CENTER haptics and stops vibration immediately when no CENTER obstacle remains within 3 m.
      */
     override fun clearContinuousCenterObstacle() {
-        if (currentContinuousMode != ContinuousHapticMode.NONE) {
+        if (currentContinuousMode != ContinuousHapticMode.NONE || activeCenterObstacleDistance != null) {
             Log.d(TAG, "Clearing cadenced CENTER haptic mode: $currentContinuousMode")
             currentContinuousMode = ContinuousHapticMode.NONE
+            activeCenterObstacleDistance = null
+            isObstacleTicksPaused = false
             lastCadenceTriggerTimeMs = 0L
-            if (!isAlertVibrating) {
+            if (currentPriority == HapticPriority.NORMAL_OBSTACLE || currentPriority == HapticPriority.CRITICAL) {
                 cancel()
             }
         }
     }
 
     /**
-     * Navigation pattern: Turn Left = 2 short pulses.
+     * Navigation pattern: Turn Left = 2 long pulses (400 ms each, 400 ms gap).
      */
     override fun vibrateTurnLeft() {
-        val timings = longArrayOf(0, 110, 90, 110)
-        val amplitudes = intArrayOf(0, 220, 0, 220)
+        vibrateTurnLeft(timeProvider())
+    }
+
+    fun vibrateTurnLeft(currentTimeMs: Long) {
+        val timings = longArrayOf(0, 400, 400, 400)
+        val amplitudes = intArrayOf(0, AMPLITUDE_NAV, 0, AMPLITUDE_NAV)
         playPattern(
             timings = timings,
             amplitudes = amplitudes,
             repeatIndex = -1,
             priority = HapticPriority.NAVIGATION,
-            description = "Navigation: Turn Left (2 short pulses)"
+            description = "Navigation: Turn Left (2 long pulses)",
+            currentTimeMs = currentTimeMs
         )
     }
 
     /**
-     * Navigation pattern: Turn Right = 3 short pulses.
+     * Navigation pattern: Turn Right = 3 long pulses (400 ms each, 400 ms gap).
      */
     override fun vibrateTurnRight() {
-        val timings = longArrayOf(0, 110, 80, 110, 80, 110)
-        val amplitudes = intArrayOf(0, 220, 0, 220, 0, 220)
+        vibrateTurnRight(timeProvider())
+    }
+
+    fun vibrateTurnRight(currentTimeMs: Long) {
+        val timings = longArrayOf(0, 400, 400, 400, 400, 400)
+        val amplitudes = intArrayOf(0, AMPLITUDE_NAV, 0, AMPLITUDE_NAV, 0, AMPLITUDE_NAV)
         playPattern(
             timings = timings,
             amplitudes = amplitudes,
             repeatIndex = -1,
             priority = HapticPriority.NAVIGATION,
-            description = "Navigation: Turn Right (3 short pulses)"
+            description = "Navigation: Turn Right (3 long pulses)",
+            currentTimeMs = currentTimeMs
         )
     }
 
     /**
-     * Navigation pattern: Destination Reached = 1 long pulse.
+     * Navigation pattern: Destination Reached / Arrival = 1 very long pulse (1200 ms).
      */
     override fun vibrateDestinationReached() {
-        val timings = longArrayOf(0, 650)
-        val amplitudes = intArrayOf(0, 255)
+        vibrateDestinationReached(timeProvider())
+    }
+
+    fun vibrateDestinationReached(currentTimeMs: Long) {
+        val timings = longArrayOf(0, 1200)
+        val amplitudes = intArrayOf(0, AMPLITUDE_STRONG)
         playPattern(
             timings = timings,
             amplitudes = amplitudes,
             repeatIndex = -1,
             priority = HapticPriority.NAVIGATION,
-            description = "Navigation: Destination Reached (1 long pulse)"
+            description = "Navigation: Destination Reached (1 very long pulse)",
+            currentTimeMs = currentTimeMs
+        )
+    }
+
+    override fun vibrateFarObstacle() {
+        vibrateObstacleBand(2.5f)
+    }
+
+    override fun vibrateNearObstacle() {
+        vibrateObstacleBand(1.8f)
+    }
+
+    override fun vibrateDangerObstacle() {
+        vibrateObstacleBand(1.0f)
+    }
+
+    fun vibrateObstacleBand(distanceMeters: Float, currentTimeMs: Long = timeProvider()) {
+        val isCritical = distanceMeters < CRITICAL_DISTANCE_METERS
+        val priority = if (isCritical) HapticPriority.CRITICAL else HapticPriority.NORMAL_OBSTACLE
+        val pattern = buildObstaclePattern(distanceMeters)
+        playPattern(
+            timings = pattern.timings,
+            amplitudes = pattern.amplitudes,
+            repeatIndex = -1,
+            priority = priority,
+            description = "ObstacleBand ($distanceMeters m)",
+            currentTimeMs = currentTimeMs
         )
     }
 
@@ -341,13 +452,14 @@ class HapticManager(
      */
     fun vibrateConfirmation() {
         val timings = longArrayOf(0, 50)
-        val amplitudes = intArrayOf(0, 150)
+        val amplitudes = intArrayOf(0, AMPLITUDE_MEDIUM)
         playPattern(
             timings = timings,
             amplitudes = amplitudes,
             repeatIndex = -1,
             priority = HapticPriority.INFO,
-            description = "Settings toggle confirmation pulse"
+            description = "Settings toggle confirmation pulse",
+            currentTimeMs = timeProvider()
         )
     }
 
@@ -359,6 +471,8 @@ class HapticManager(
         currentPriority = HapticPriority.NONE
         currentContinuousMode = ContinuousHapticMode.NONE
         isAlertVibrating = false
+        currentPatternEndTimeMs = 0L
+        isObstacleTicksPaused = false
         lastCadenceTriggerTimeMs = 0L
         try {
             controller.cancel()
@@ -368,25 +482,71 @@ class HapticManager(
         }
     }
 
+    fun onPatternCompleted(sessionId: Long, currentTimeMs: Long = timeProvider()) {
+        if (currentSessionId == sessionId) {
+            val wasNavigation = currentPriority == HapticPriority.NAVIGATION
+            currentPriority = HapticPriority.NONE
+            currentPatternEndTimeMs = 0L
+            isAlertVibrating = false
+            Log.d(TAG, "Haptic finished (sessionId=$sessionId). Priority reset to NONE.")
+
+            // Requirement 4: A navigation cue briefly pauses obstacle ticks and lets them resume
+            if (wasNavigation && isObstacleTicksPaused) {
+                isObstacleTicksPaused = false
+                val dist = activeCenterObstacleDistance
+                if (dist != null && dist <= WARNING_DISTANCE_METERS) {
+                    Log.i(TAG, "Resuming paused obstacle ticks after navigation cue: ${dist}m")
+                    lastCadenceTriggerTimeMs = 0L
+                    updateContinuousCenterObstacle(dist, currentTimeMs)
+                }
+            }
+        }
+    }
+
     private fun playPattern(
         timings: LongArray,
         amplitudes: IntArray,
         repeatIndex: Int,
         priority: HapticPriority,
-        description: String
+        description: String,
+        currentTimeMs: Long
     ): Boolean {
         if (!isEnabled || !hasVibrator) {
             Log.d(TAG, "Haptics disabled or no vibrator. Skipping $description")
             return false
         }
 
-        // Never queue up old vibrations; drop lower priority vibrations
-        if (priority.value < currentPriority.value) {
-            Log.d(TAG, "Suppressed '$description' ($priority) due to higher priority active: $currentPriority")
-            return false
+        // Check if previous pattern duration has expired naturally by time
+        if (currentTimeMs >= currentPatternEndTimeMs && currentPriority != HapticPriority.NONE) {
+            onPatternCompleted(currentSessionId, currentTimeMs)
         }
 
-        // Cancel previous vibration when equal or higher priority starts
+        val isCurrentlyPlaying = currentTimeMs < currentPatternEndTimeMs
+
+        if (isCurrentlyPlaying) {
+            // Drop lower priority vibrations
+            if (priority.value < currentPriority.value) {
+                Log.d(TAG, "Suppressed '$description' ($priority) due to higher priority active: $currentPriority")
+                return false
+            }
+            // Never overlap two patterns: equal priority drops rather than interrupting mid-waveform
+            if (priority.value == currentPriority.value) {
+                Log.d(TAG, "Suppressed '$description' ($priority) due to equal priority currently playing (no overlap)")
+                return false
+            }
+        }
+
+        // Navigation cue pausing normal obstacle ticks:
+        if (priority == HapticPriority.NAVIGATION && (currentPriority == HapticPriority.NORMAL_OBSTACLE || currentContinuousMode != ContinuousHapticMode.NONE)) {
+            isObstacleTicksPaused = true
+            Log.i(TAG, "Navigation cue pausing normal obstacle ticks.")
+        }
+
+        // Enforce maximum single pattern duration (never indefinite loop)
+        val safePattern = enforceMaxDuration(Pattern(timings, amplitudes))
+        val totalDurationMs = safePattern.timings.sum()
+
+        // Cancel previous hardware vibration when preempting
         try {
             controller.cancel()
         } catch (e: Exception) {
@@ -395,131 +555,97 @@ class HapticManager(
 
         currentPriority = priority
         val sessionId = ++currentSessionId
+        currentPatternEndTimeMs = currentTimeMs + totalDurationMs
+
+        // Scale amplitudes by vibration strength
+        val scaledAmplitudes = IntArray(safePattern.amplitudes.size) { i ->
+            val raw = safePattern.amplitudes[i]
+            if (raw == 0) 0 else (raw * vibrationStrength.scaleFactor).roundToInt().coerceIn(1, 255)
+        }
 
         try {
+            // RepeatIndex is always -1 (no indefinite looping)
             controller.vibrate(
-                timings = timings,
-                amplitudes = if (hasAmplitudeControl) amplitudes else null,
-                repeatIndex = repeatIndex
+                timings = safePattern.timings,
+                amplitudes = if (hasAmplitudeControl) scaledAmplitudes else null,
+                repeatIndex = -1
             )
-            Log.i(TAG, "Triggered haptic: $description | Priority: $priority | Repeat: $repeatIndex")
+            Log.i(TAG, "Triggered haptic: $description | Priority: $priority | Duration: ${totalDurationMs}ms | Strength: $vibrationStrength")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to vibrate for $description", e)
             currentPriority = HapticPriority.NONE
+            currentPatternEndTimeMs = 0L
             isAlertVibrating = false
             return false
         }
 
-        // If one-shot, reset priority after duration completes
-        if (repeatIndex == -1) {
-            val totalDurationMs = timings.sum()
-            handler?.postDelayed({
-                if (currentSessionId == sessionId) {
-                    currentPriority = HapticPriority.NONE
-                    Log.d(TAG, "Haptic finished: $description. Priority reset to NONE.")
-                }
-            }, totalDurationMs)
-        }
+        // Schedule priority reset and resumption when pattern finishes
+        handler?.postDelayed({
+            onPatternCompleted(sessionId, timeProvider())
+        }, totalDurationMs)
 
         return true
     }
 
-    private data class Pattern(val timings: LongArray, val amplitudes: IntArray)
+    private fun enforceMaxDuration(pattern: Pattern): Pattern {
+        var accumulated = 0L
+        val boundedTimings = mutableListOf<Long>()
+        val boundedAmplitudes = mutableListOf<Int>()
 
-    private fun buildObstaclePattern(
-        distanceMeters: Float,
-        zone: Zone?,
-        isContinuous: Boolean
-    ): Pattern {
+        for (i in pattern.timings.indices) {
+            val t = pattern.timings[i]
+            val a = pattern.amplitudes.getOrElse(i) { 0 }
+            if (accumulated + t <= MAX_PATTERN_DURATION_MS) {
+                boundedTimings.add(t)
+                boundedAmplitudes.add(a)
+                accumulated += t
+            } else {
+                val remainder = MAX_PATTERN_DURATION_MS - accumulated
+                if (remainder > 0) {
+                    boundedTimings.add(remainder)
+                    boundedAmplitudes.add(a)
+                }
+                break
+            }
+        }
+        return Pattern(boundedTimings.toLongArray(), boundedAmplitudes.toIntArray())
+    }
+
+    data class Pattern(val timings: LongArray, val amplitudes: IntArray)
+
+    /**
+     * Builds obstacle proximity pattern: sequence of identical short crisp ticks (80-100 ms).
+     * Gap shrinks with distance:
+     * - 2-3 m: ~1200 ms gap, soft amplitude
+     * - 1.5-2 m: ~600 ms gap, medium amplitude
+     * - below 1.5 m: ~250 ms gap, strongest amplitude (255)
+     */
+    fun buildObstaclePattern(distanceMeters: Float): Pattern {
         val isCritical = distanceMeters < CRITICAL_DISTANCE_METERS
-        val isWarning = !isCritical && distanceMeters <= WARNING_DISTANCE_METERS
-
         return when {
-            // Under 1.5m: Fast strong pulses (finite 3-cycle cadence for center)
+            // Below 1.5m: Danger, ~250ms gap, strongest amplitude (3 crisp ticks)
             isCritical -> {
                 val amp = AMPLITUDE_STRONG
-                when (zone) {
-                    Zone.LEFT -> {
-                        Pattern(
-                            timings = longArrayOf(0, 80, 50, 80, 100, 80, 50, 80),
-                            amplitudes = intArrayOf(0, amp, 0, amp, 0, amp, 0, amp)
-                        )
-                    }
-                    Zone.RIGHT -> {
-                        Pattern(
-                            timings = longArrayOf(0, 70, 50, 70, 50, 70, 100, 70, 50, 70, 50, 70),
-                            amplitudes = intArrayOf(0, amp, 0, amp, 0, amp, 0, amp, 0, amp, 0, amp)
-                        )
-                    }
-                    else -> { // CENTER or null: 3-cycle finite pulse
-                        if (isContinuous) {
-                            Pattern(
-                                timings = longArrayOf(0, 120, 50, 70, 70, 120, 50, 70, 70, 120, 50, 70),
-                                amplitudes = intArrayOf(0, amp, 0, amp, 0, amp, 0, amp, 0, amp, 0, amp)
-                            )
-                        } else {
-                            Pattern(
-                                timings = longArrayOf(0, 140, 50, 70, 100, 140, 50, 70),
-                                amplitudes = intArrayOf(0, amp, 0, amp, 0, amp, 0, amp)
-                            )
-                        }
-                    }
-                }
+                Pattern(
+                    timings = longArrayOf(0, TICK_DURATION_MS, GAP_DANGER_MS, TICK_DURATION_MS, GAP_DANGER_MS, TICK_DURATION_MS),
+                    amplitudes = intArrayOf(0, amp, 0, amp, 0, amp)
+                )
             }
-
-            // 1.5m - 3m: Repeated medium pulses (finite 3-cycle cadence for center)
-            isWarning -> {
+            // 1.5m - 2.0m: Near, ~600ms gap, medium amplitude
+            distanceMeters < 2.0f -> {
                 val amp = AMPLITUDE_MEDIUM
-                when (zone) {
-                    Zone.LEFT -> {
-                        Pattern(
-                            timings = longArrayOf(0, 100, 80, 100, 250, 100, 80, 100),
-                            amplitudes = intArrayOf(0, amp, 0, amp, 0, amp, 0, amp)
-                        )
-                    }
-                    Zone.RIGHT -> {
-                        Pattern(
-                            timings = longArrayOf(0, 80, 60, 80, 60, 80, 250, 80, 60, 80, 60, 80),
-                            amplitudes = intArrayOf(0, amp, 0, amp, 0, amp, 0, amp)
-                        )
-                    }
-                    else -> { // CENTER or null: 3-cycle finite medium pulse
-                        if (isContinuous) {
-                            Pattern(
-                                timings = longArrayOf(0, 140, 70, 70, 80, 140, 70, 70, 80, 140, 70, 70),
-                                amplitudes = intArrayOf(0, amp, 0, amp, 0, amp, 0, amp, 0, amp, 0, amp)
-                            )
-                        } else {
-                            Pattern(
-                                timings = longArrayOf(0, 180, 80, 80, 250, 180, 80, 80),
-                                amplitudes = intArrayOf(0, amp, 0, amp, 0, amp, 0, amp)
-                            )
-                        }
-                    }
-                }
+                Pattern(
+                    timings = longArrayOf(0, TICK_DURATION_MS, GAP_NEAR_MS, TICK_DURATION_MS),
+                    amplitudes = intArrayOf(0, amp, 0, amp)
+                )
             }
-
-            // Over 3m: Single soft short pulse
+            // 2.0m - 3.0m: Far, ~1200ms gap, soft amplitude
             else -> {
                 val amp = AMPLITUDE_SOFT
-                when (zone) {
-                    Zone.LEFT -> Pattern(
-                        timings = longArrayOf(0, 70, 60, 70),
-                        amplitudes = intArrayOf(0, amp, 0, amp)
-                    )
-                    Zone.RIGHT -> Pattern(
-                        timings = longArrayOf(0, 60, 50, 60, 50, 60),
-                        amplitudes = intArrayOf(0, amp, 0, amp, 0, amp)
-                    )
-                    Zone.CENTER -> Pattern(
-                        timings = longArrayOf(0, 130, 60, 60),
-                        amplitudes = intArrayOf(0, amp, 0, amp)
-                    )
-                    else -> Pattern(
-                        timings = longArrayOf(0, 90),
-                        amplitudes = intArrayOf(0, amp)
-                    )
-                }
+                Pattern(
+                    timings = longArrayOf(0, TICK_DURATION_MS, GAP_FAR_MS, TICK_DURATION_MS),
+                    amplitudes = intArrayOf(0, amp, 0, amp)
+                )
             }
         }
     }
@@ -527,15 +653,29 @@ class HapticManager(
     companion object {
         private const val TAG = "HapticManager"
 
+        // Tick duration: about 80-100 ms each
+        const val TICK_DURATION_MS = 90L
+
+        // Gaps between obstacle ticks:
+        const val GAP_FAR_MS = 1200L      // 2-3 m
+        const val GAP_NEAR_MS = 600L      // 1.5-2 m
+        const val GAP_DANGER_MS = 250L    // < 1.5 m
+
+        // Requirement 2: Every vibration pause between pulses >= 150 ms
+        const val MIN_PAUSE_MS = 150L
+
         const val CRITICAL_DISTANCE_METERS = 1.5f
         const val HYSTERESIS_DEADBAND_METERS = 0.3f
         const val CRITICAL_EXIT_THRESHOLD_METERS = CRITICAL_DISTANCE_METERS + HYSTERESIS_DEADBAND_METERS // 1.8f
         const val WARNING_DISTANCE_METERS = 3.0f
 
-        const val CADENCE_MIN_INTERVAL_MS = 800L
+        // Maximum single pattern duration
+        const val MAX_PATTERN_DURATION_MS = 2500L
 
-        const val AMPLITUDE_SOFT = 95
+        // Base amplitudes before scaling
+        const val AMPLITUDE_SOFT = 100
         const val AMPLITUDE_MEDIUM = 180
         const val AMPLITUDE_STRONG = 255
+        const val AMPLITUDE_NAV = 220
     }
 }

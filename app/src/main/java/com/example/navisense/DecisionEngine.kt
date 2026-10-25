@@ -5,11 +5,21 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Tracks the last announced alert timestamp and distance for cooldown evaluation.
+ * Tracks the last announced alert timestamp, distance, and avoidance advice for cooldown evaluation.
  */
 data class LastAlertRecord(
     val timestamp: Long,
-    val distanceMeters: Float
+    val distanceMeters: Float,
+    val lastAdvice: AvoidanceAdvice? = null
+)
+
+/**
+ * Context regarding active navigation used to coordinate avoidance advice with turn instructions.
+ */
+data class NavigationContext(
+    val isNavigating: Boolean = false,
+    val upcomingManeuverType: ManeuverType? = null,
+    val distanceToManeuverMeters: Double? = null
 )
 
 /**
@@ -17,7 +27,9 @@ data class LastAlertRecord(
  * - Requires 3 consecutive frames before triggering obstacle alerts
  * - Filters by class-specific score thresholds (0.6 for vehicles, 0.5 for others)
  * - Enforces median distance smoothing over last 5 frames
- * - Performs sanity checks (large box / extreme vehicle aspect ratio -> "Large obstacle ahead", no urgent interrupt)
+ * - Performs sanity checks (large box / extreme vehicle aspect ratio -> "Large obstacle ahead. Stop.", no urgent interrupt)
+ * - Computes avoidance guidance ("Step left", "Step right", "Stop") for center obstacles <= 3 m
+ * - Prevents advice contradicting upcoming turns within 10 m of a maneuver
  * - Prevents dual vibration collision: only one vibration source active per frame
  * - Enforces cooldowns and synchronized speech / haptics.
  */
@@ -25,7 +37,8 @@ class DecisionEngine(
     private val voiceManager: VoiceNotifier,
     private val hapticManager: HapticNotifier,
     val tracker: ObstacleTracker = ObstacleTracker(),
-    private val timeProvider: () -> Long = { System.currentTimeMillis() }
+    private val timeProvider: () -> Long = { System.currentTimeMillis() },
+    val avoidanceAdvisor: AvoidanceAdvisor = AvoidanceAdvisor()
 ) {
 
     var isVoiceEnabled: Boolean = true
@@ -47,6 +60,8 @@ class DecisionEngine(
             }
         }
 
+    var maxAlertDistanceMeters: Float = MAX_DETECTION_DISTANCE_METERS
+
     var isEnabled: Boolean
         get() = isVoiceEnabled || isHapticsEnabled
         set(value) {
@@ -54,7 +69,10 @@ class DecisionEngine(
             isHapticsEnabled = value
         }
 
-    // Tracks cooldown per (label, zone) -> last spoken timestamp & distance
+    var navigationContext: NavigationContext? = null
+    var navigationContextProvider: (() -> NavigationContext?)? = null
+
+    // Tracks cooldown per (label, zone) -> last spoken timestamp & distance & advice
     private val lastAlertMap = ConcurrentHashMap<Pair<String, Zone>, LastAlertRecord>()
 
     fun processDetections(
@@ -74,20 +92,20 @@ class DecisionEngine(
             return
         }
 
-        // 1. Update ObstacleTracker (Requirement 1, 2, 3, 4)
+        // 1. Update ObstacleTracker
         val trackedObstacles = tracker.update(detections, frameWidthPx, frameHeightPx)
 
-        // 2. Filter whitelisted & alert-eligible obstacles (3 consecutive frames, distance <= 5m)
+        // 2. Filter whitelisted & alert-eligible obstacles (3 consecutive frames, distance <= maxAlertDistanceMeters)
         val validObstacles = trackedObstacles.filter { tracked ->
             val normalizedLabel = tracked.label.trim().lowercase(Locale.US)
             val isWhitelisted = normalizedLabel in OBSTACLE_WHITELIST
-            val inRange = tracked.smoothedDistanceMeters > 0f && tracked.smoothedDistanceMeters <= MAX_DETECTION_DISTANCE_METERS
+            val inRange = tracked.smoothedDistanceMeters > 0f && tracked.smoothedDistanceMeters <= maxAlertDistanceMeters
             val isEligible = tracked.isAlertEligible // consecutiveFrames >= 3
 
             if (!isWhitelisted) {
                 Log.d(TAG, "Ignoring non-whitelisted detection: '${tracked.label}'")
             } else if (!inRange) {
-                Log.d(TAG, "Ignoring detection beyond 5m: '${tracked.label}' at ${tracked.smoothedDistanceMeters}m")
+                Log.d(TAG, "Ignoring detection beyond ${maxAlertDistanceMeters}m: '${tracked.label}' at ${tracked.smoothedDistanceMeters}m")
             } else if (!isEligible) {
                 Log.d(TAG, "Obstacle '${tracked.label}' at frame ${tracked.consecutiveFrames}/3; waiting for 3 consecutive frames.")
             }
@@ -130,22 +148,64 @@ class DecisionEngine(
                 val isVeryClose = !obstacle.isUnreliableOrLarge && (
                     obstacle.smoothedDistanceMeters < CRITICAL_DISTANCE_THRESHOLD_METERS || (!isVehicle && obstacle.isLargeBox)
                 )
-                val message = formatMessage(obstacle)
 
-                lastAlertMap[key] = LastAlertRecord(timestamp = now, distanceMeters = obstacle.smoothedDistanceMeters)
+                // Requirement 1 & 2: Trigger avoidance advice only when a CENTER obstacle on the whitelist
+                // is within 3 m (and not a vehicle large-box "unreliable" case).
+                val triggersAvoidance = obstacle.zone == Zone.CENTER &&
+                    obstacle.smoothedDistanceMeters <= AvoidanceAdvisor.MAX_AVOIDANCE_TRIGGER_DISTANCE_METERS &&
+                    !obstacle.isUnreliableOrLarge
+
+                val rawAdvice = if (triggersAvoidance) {
+                    val effectiveWidth = if (frameWidthPx > 0) frameWidthPx else detections.firstOrNull { it.frameWidthPx > 0 }?.frameWidthPx ?: 1000
+                    avoidanceAdvisor.evaluateAdvice(obstacle, validObstacles, effectiveWidth)
+                } else {
+                    null
+                }
+
+                // Requirement 5: If navigation is active, do not give avoidance advice that contradicts
+                // a turn instruction within 10 m of a manoeuvre: in that case say only "Obstacle ahead, <distance> meters. Stop."
+                val nav = navigationContextProvider?.invoke() ?: navigationContext
+                val isNavActive = nav?.isNavigating == true
+                val isNearManeuver = nav?.distanceToManeuverMeters != null && nav.distanceToManeuverMeters <= 10.0
+                val contradictsNav = isNavActive && isNearManeuver && rawAdvice != null &&
+                    contradictsTurnInstruction(rawAdvice, nav?.upcomingManeuverType)
+
+                val currentAdvice = when {
+                    obstacle.isUnreliableOrLarge && obstacle.zone == Zone.CENTER -> AvoidanceAdvice.STOP
+                    contradictsNav -> AvoidanceAdvice.STOP
+                    else -> rawAdvice
+                }
+
+                // Requirement 4: speak the direction only when the advice changes or on the first alert for that obstacle.
+                val isFirstAlert = (lastRecord == null)
+                val adviceChanged = (lastRecord != null && currentAdvice != lastRecord.lastAdvice)
+                val includeAdvice = (isFirstAlert || adviceChanged) && currentAdvice != null
+
+                val message = formatMessage(
+                    obstacle = obstacle,
+                    advice = currentAdvice,
+                    includeAdvice = includeAdvice,
+                    contradictsNav = contradictsNav
+                )
+
+                lastAlertMap[key] = LastAlertRecord(
+                    timestamp = now,
+                    distanceMeters = obstacle.smoothedDistanceMeters,
+                    lastAdvice = currentAdvice
+                )
 
                 Log.i(
                     TAG,
-                    "DecisionEngine trigger -> \"$message\" | Zone: ${obstacle.zone} | Dist: ${String.format(Locale.US, "%.2f", obstacle.smoothedDistanceMeters)}m | Voice: $isVoiceEnabled | Haptics: $isHapticsEnabled | VeryClose: $isVeryClose | Unreliable: ${obstacle.isUnreliableOrLarge}"
+                    "DecisionEngine trigger -> \"$message\" | Zone: ${obstacle.zone} | Dist: ${String.format(Locale.US, "%.2f", obstacle.smoothedDistanceMeters)}m | Advice: $currentAdvice | Voice: $isVoiceEnabled | Haptics: $isHapticsEnabled | VeryClose: $isVeryClose | Unreliable: ${obstacle.isUnreliableOrLarge}"
                 )
 
                 if (isVoiceEnabled) {
                     voiceManager.speak(message, interrupt = isVeryClose)
                 }
 
-                // Requirement 7: Single vibration source - trigger one-shot alert haptic
-                // For very close non-vehicles with large boxes, ensure critical haptic pattern (< 1.5m)
-                if (isHapticsEnabled && !oneShotHapticFired) {
+                // Requirement 6: Obstacle vibration is only for CENTER-zone obstacles within 3 m.
+                // LEFT and RIGHT obstacles produce no vibration (voice only). No vibration for direction advice.
+                if (isHapticsEnabled && !oneShotHapticFired && obstacle.zone == Zone.CENTER && obstacle.smoothedDistanceMeters <= CONTINUOUS_HAPTIC_THRESHOLD_METERS) {
                     val hapticDist = if (!isVehicle && obstacle.isLargeBox) {
                         obstacle.smoothedDistanceMeters.coerceAtMost(CRITICAL_DISTANCE_THRESHOLD_METERS - 0.1f)
                     } else {
@@ -160,7 +220,7 @@ class DecisionEngine(
         }
 
         // 4. Center obstacle cadenced haptics
-        // Requirement 7: Single vibration source - do NOT fire cadence if one-shot alert fired on this frame
+        // Single vibration source - do NOT fire cadence if one-shot alert fired on this frame
         val closestCenterObstacle = validObstacles
             .filter { it.zone == Zone.CENTER && (it.smoothedDistanceMeters < CONTINUOUS_HAPTIC_THRESHOLD_METERS || (!it.isUnreliableOrLarge && it.isLargeBox)) }
             .minByOrNull { it.smoothedDistanceMeters }
@@ -201,22 +261,40 @@ class DecisionEngine(
         return "$distStr $unit"
     }
 
-    fun formatMessage(obstacle: TrackedObstacle): String {
-        // Requirement 4: If box is unreliable or large, say "Large obstacle ahead" without a number
+    fun formatMessage(
+        obstacle: TrackedObstacle,
+        advice: AvoidanceAdvice? = null,
+        includeAdvice: Boolean = false,
+        contradictsNav: Boolean = false
+    ): String {
+        // Requirement 3: For unreliable or large vehicle boxes say "Large obstacle ahead. Stop."
         if (obstacle.isUnreliableOrLarge) {
             return when (obstacle.zone) {
-                Zone.CENTER -> "Large obstacle ahead"
+                Zone.CENTER -> "Large obstacle ahead. Stop."
                 Zone.LEFT -> "Large obstacle on your left"
                 Zone.RIGHT -> "Large obstacle on your right"
             }
         }
 
+        val distanceText = formatDistance(obstacle.smoothedDistanceMeters)
+
+        // Requirement 5: Contradictory navigation within 10m of maneuver
+        if (contradictsNav) {
+            return "Obstacle ahead, $distanceText. Stop."
+        }
+
         val capitalizedLabel = obstacle.label.trim().replaceFirstChar {
             if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString()
         }
-        val distanceText = formatDistance(obstacle.smoothedDistanceMeters)
+
         return when (obstacle.zone) {
-            Zone.CENTER -> "$capitalizedLabel ahead, $distanceText"
+            Zone.CENTER -> {
+                if (includeAdvice && advice != null) {
+                    "$capitalizedLabel ahead, $distanceText. ${advice.spokenText}."
+                } else {
+                    "$capitalizedLabel ahead, $distanceText"
+                }
+            }
             Zone.LEFT -> "$capitalizedLabel on your left, $distanceText"
             Zone.RIGHT -> "$capitalizedLabel on your right, $distanceText"
         }
@@ -225,7 +303,7 @@ class DecisionEngine(
     fun formatMessage(detection: Detection): String {
         if (detection.isUnreliableOrLarge) {
             return when (detection.zone) {
-                Zone.CENTER -> "Large obstacle ahead"
+                Zone.CENTER -> "Large obstacle ahead. Stop."
                 Zone.LEFT -> "Large obstacle on your left"
                 Zone.RIGHT -> "Large obstacle on your right"
             }
@@ -247,6 +325,7 @@ class DecisionEngine(
         tracker.clear()
         hapticManager.clearContinuousCenterObstacle()
         hapticManager.cancel()
+        navigationContext = null
         Log.i(TAG, "DecisionEngine alert records and haptics cleared.")
     }
 
@@ -259,6 +338,29 @@ class DecisionEngine(
 
         const val COOLDOWN_MS = 8000L
         const val DISTANCE_CHANGE_THRESHOLD_METERS = 1.0f
+
+        /**
+         * Checks whether avoidance advice contradicts an upcoming turn maneuver.
+         */
+        fun contradictsTurnInstruction(
+            advice: AvoidanceAdvice,
+            maneuverType: ManeuverType?
+        ): Boolean {
+            if (maneuverType == null) return false
+            return when (maneuverType) {
+                ManeuverType.TURN_LEFT,
+                ManeuverType.TURN_SLIGHT_LEFT,
+                ManeuverType.TURN_SHARP_LEFT,
+                ManeuverType.U_TURN -> advice == AvoidanceAdvice.STEP_RIGHT
+
+                ManeuverType.TURN_RIGHT,
+                ManeuverType.TURN_SLIGHT_RIGHT,
+                ManeuverType.TURN_SHARP_RIGHT -> advice == AvoidanceAdvice.STEP_LEFT
+
+                ManeuverType.STRAIGHT,
+                ManeuverType.UNKNOWN -> false
+            }
+        }
 
         val OBSTACLE_WHITELIST = setOf(
             "person",

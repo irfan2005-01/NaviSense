@@ -1,5 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Base application theme -->
+    <style name="Theme.NaviSense" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#121212</item>
+        <item name="android:navigationBarColor">#121212</item>
+    </style>
 
-    <style name="Theme.NaviSense" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- Splash screen theme using AndroidX Core SplashScreen API -->
+    <style name="Theme.NaviSense.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">#121212</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="postSplashScreenTheme">@style/Theme.NaviSense</item>
+    </style>
 </resources>

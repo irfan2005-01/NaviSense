@@ -27,6 +27,23 @@ class VoiceManager(context: Context) : TextToSpeech.OnInitListener, VoiceNotifie
     private var pendingSpeech: Pair<String, (() -> Unit)?>? = null
     private val utteranceCallbacks = ConcurrentHashMap<String, () -> Unit>()
 
+    var isEnabled: Boolean = true
+        set(value) {
+            field = value
+            if (!value) {
+                stop()
+            }
+        }
+
+    var speechRate: Float = 1.0f
+        private set
+
+    fun setSpeechRate(rate: Float) {
+        speechRate = rate
+        tts?.setSpeechRate(rate)
+        Log.d(tag, "Speech rate set to: $rate")
+    }
+
     // Tracking for priority coordination (close obstacle alerts vs navigation instructions)
     private var activeNavigationInstruction: String? = null
     private var pendingNavigationInstruction: String? = null
@@ -73,7 +90,8 @@ class VoiceManager(context: Context) : TextToSpeech.OnInitListener, VoiceNotifie
                 Log.e(tag, "Language not supported or missing data.")
             } else {
                 isReady = true
-                Log.d(tag, "TextToSpeech initialized successfully.")
+                tts?.setSpeechRate(speechRate)
+                Log.d(tag, "TextToSpeech initialized successfully with rate $speechRate.")
                 pendingSpeech?.let { (speechText, callback) ->
                     speak(speechText, false, callback)
                     pendingSpeech = null
@@ -122,6 +140,11 @@ class VoiceManager(context: Context) : TextToSpeech.OnInitListener, VoiceNotifie
     }
 
     override fun speak(text: String, interrupt: Boolean, onDone: (() -> Unit)?) {
+        if (!isEnabled) {
+            onDone?.invoke()
+            return
+        }
+
         if (!isReady) {
             Log.d(tag, "Queueing pending speech: $text")
             pendingSpeech = Pair(text, onDone)

@@ -107,7 +107,20 @@ class CameraManager(private val context: Context) {
         }, ContextCompat.getMainExecutor(context))
     }
 
+    fun stopCamera() {
+        try {
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+            if (cameraProviderFuture.isDone) {
+                cameraProviderFuture.get().unbindAll()
+                Log.d(TAG, "Camera use cases successfully unbound.")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping camera", e)
+        }
+    }
+
     fun shutdown() {
+        stopCamera()
         cameraExecutor.shutdown()
     }
 

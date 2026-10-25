@@ -69,6 +69,8 @@ dependencies {
     implementation(libs.mediapipe.tasks.vision)
     implementation(libs.play.services.location)
     implementation(libs.okhttp)
+    implementation(libs.androidx.navigation.compose)
+    implementation(libs.androidx.core.splashscreen)
     testImplementation(libs.junit)
     testImplementation("org.json:json:20240303")
     androidTestImplementation(platform(libs.androidx.compose.bom))
