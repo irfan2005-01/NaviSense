@@ -3,10 +3,10 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Outer Eye contour -->
+    <!-- Outer Eye contour in Cream (Vanilla Cloud) -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#00E5FF"
+        android:strokeColor="#FFF8DF"
         android:strokeWidth="4"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
@@ -15,14 +15,14 @@
     <!-- Center Iris Circle -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#FFFFFF"
+        android:strokeColor="#FFF8DF"
         android:strokeWidth="3"
         android:pathData="M 54,54 m -15,0 a 15,15 0 1,0 30,0 a 15,15 0 1,0 -30,0" />
 
-    <!-- Navigation Pointer / Arrow inside Iris -->
+    <!-- Navigation Pointer / Arrow inside Iris in Cream -->
     <path
-        android:fillColor="#00E5FF"
-        android:strokeColor="#FFFFFF"
+        android:fillColor="#FFF8DF"
+        android:strokeColor="#FFF8DF"
         android:strokeWidth="1.5"
         android:pathData="M 54,43 L 62,60 L 54,56 L 46,60 Z" />
 </vector>

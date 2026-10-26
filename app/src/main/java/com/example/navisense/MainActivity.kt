@@ -10,6 +10,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -54,6 +58,7 @@ class MainActivity : ComponentActivity() {
     // Calibration and debug overlay state
     private val showDebugOverlayState = mutableStateOf(false)
     private val lastEstimatedObstacleState = mutableStateOf<Pair<String, Float>?>(null)
+    private val lastSpokenCaptionState = mutableStateOf<String?>(null)
 
     // Flag tracking active Assist mode to conserve camera/sensor resources
     private var isAssistActive: Boolean = false
@@ -77,6 +82,11 @@ class MainActivity : ComponentActivity() {
         // Initialize core engines and repositories
         settingsRepository = SettingsRepository(this)
         voiceManager = VoiceManager(this)
+        voiceManager.onMessageSpoken = { spokenText ->
+            runOnUiThread {
+                lastSpokenCaptionState.value = spokenText
+            }
+        }
         hapticManager = HapticManager(this)
         cameraManager = CameraManager(this)
         distanceEstimator = DistanceEstimator(this)
@@ -179,10 +189,34 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Requirement 8: Navigation Compose NavHost
+                // Requirement 8: Navigation Compose NavHost with smooth transitions
                 NavHost(
                     navController = navController,
-                    startDestination = NavDestinations.HOME
+                    startDestination = NavDestinations.HOME,
+                    enterTransition = {
+                        fadeIn(animationSpec = tween(280)) + slideIntoContainer(
+                            AnimatedContentTransitionScope.SlideDirection.Start,
+                            animationSpec = tween(280)
+                        )
+                    },
+                    exitTransition = {
+                        fadeOut(animationSpec = tween(280)) + slideOutOfContainer(
+                            AnimatedContentTransitionScope.SlideDirection.Start,
+                            animationSpec = tween(280)
+                        )
+                    },
+                    popEnterTransition = {
+                        fadeIn(animationSpec = tween(280)) + slideIntoContainer(
+                            AnimatedContentTransitionScope.SlideDirection.End,
+                            animationSpec = tween(280)
+                        )
+                    },
+                    popExitTransition = {
+                        fadeOut(animationSpec = tween(280)) + slideOutOfContainer(
+                            AnimatedContentTransitionScope.SlideDirection.End,
+                            animationSpec = tween(280)
+                        )
+                    }
                 ) {
                     // Screen 1: Home Screen
                     composable(NavDestinations.HOME) {
@@ -234,6 +268,7 @@ class MainActivity : ComponentActivity() {
                         val statusMsg by statusMessageState
                         val showDebug by showDebugOverlayState
                         val lastObstacle by lastEstimatedObstacleState
+                        val lastSpokenCaption by lastSpokenCaptionState
 
                         AssistScreen(
                             cameraManager = cameraManager,
@@ -256,6 +291,7 @@ class MainActivity : ComponentActivity() {
                             statusMsg = statusMsg,
                             showDebugOverlay = showDebug,
                             lastObstacle = lastObstacle,
+                            lastSpokenCaption = lastSpokenCaption,
                             onToggleDebugOverlay = {
                                 val newState = !showDebugOverlayState.value
                                 showDebugOverlayState.value = newState
@@ -274,6 +310,7 @@ class MainActivity : ComponentActivity() {
                     composable(NavDestinations.SETTINGS) {
                         SettingsScreen(
                             settings = appSettings,
+                            voiceManager = voiceManager,
                             onUpdateVoice = { enabled ->
                                 appSettings = settingsRepository.setVoiceEnabled(enabled)
                                 applySettings(appSettings)
@@ -306,6 +343,11 @@ class MainActivity : ComponentActivity() {
                                 appSettings = settingsRepository.setMaxAlertDistance(dist)
                                 applySettings(appSettings)
                                 voiceManager.speak("Maximum alert distance set to ${dist.toInt()} meters", interrupt = true)
+                            },
+                            onUpdateSelectedVoice = { voiceName ->
+                                appSettings = settingsRepository.setSelectedVoice(voiceName)
+                                applySettings(appSettings)
+                                voiceManager.previewVoice(voiceName, "Selected guide voice applied.")
                             },
                             onBack = {
                                 navController.popBackStack()
@@ -340,7 +382,9 @@ class MainActivity : ComponentActivity() {
 
     private fun applySettings(settings: AppSettings) {
         voiceManager.isEnabled = settings.isVoiceEnabled
-        voiceManager.setSpeechRate(settings.speechRate.rate)
+        val rateToApply = if (settings.speechRate == SpeechRate.NORMAL) 0.95f else settings.speechRate.rate
+        voiceManager.setSpeechRate(rateToApply)
+        voiceManager.preferredVoiceName = settings.selectedVoiceName
         hapticManager.isEnabled = settings.isHapticsEnabled
         hapticManager.vibrationStrength = settings.vibrationStrength
         decisionEngine.isVoiceEnabled = settings.isVoiceEnabled
@@ -377,6 +421,7 @@ class MainActivity : ComponentActivity() {
         detectionsState.value = emptyList()
         currentRouteState.value = null
         statusMessageState.value = null
+        lastSpokenCaptionState.value = null
     }
 
     private fun hasAllRequiredPermissions(): Boolean {

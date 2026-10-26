@@ -216,18 +216,17 @@ fun DetectionOverlay(
             val right = box.right * scale + offsetX
             val bottom = box.bottom * scale + offsetY
 
-            val boxColor = when (detection.zone) {
-                Zone.LEFT -> Color(0xFF29B6F6) // Light Blue
-                Zone.CENTER -> Color(0xFF66BB6A) // Green
-                Zone.RIGHT -> Color(0xFFFFA726) // Orange
-            }
+            val isCritical = detection.distanceMeters in 0.001f..1.499f
+            val outlineColor = if (isCritical) Color(0xFFFC6C26) else Color(0xFFFFF8DF)
+            val pillColor = if (isCritical) Color(0xFFFC6C26) else Color(0xEE69346C)
+            val textColor = if (isCritical) Color(0xFF2A1230) else Color(0xFFFFF8DF)
 
-            // Draw bounding box
+            // Draw bounding box with cream outline (or Signal Orange for critical < 1.5m)
             drawRect(
-                color = boxColor,
+                color = outlineColor,
                 topLeft = Offset(left, top),
                 size = Size((right - left).coerceAtLeast(0f), (bottom - top).coerceAtLeast(0f)),
-                style = Stroke(width = 3.dp.toPx())
+                style = Stroke(width = if (isCritical) 3.5.dp.toPx() else 2.5.dp.toPx())
             )
 
             // Label text format: "person 2.1m (CENTER)"
@@ -236,7 +235,7 @@ fun DetectionOverlay(
             val textLayoutResult = textMeasurer.measure(
                 text = AnnotatedString(labelText),
                 style = TextStyle(
-                    color = Color.White,
+                    color = textColor,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold
                 )
@@ -248,9 +247,9 @@ fun DetectionOverlay(
             val labelTop = (top - textHeight).coerceAtLeast(0f)
             val labelLeft = left.coerceIn(0f, (viewWidth - textWidth).coerceAtLeast(0f))
 
-            // Background pill for label
+            // Background pill for label (Berry pill or Signal Orange for critical)
             drawRect(
-                color = boxColor.copy(alpha = 0.85f),
+                color = pillColor,
                 topLeft = Offset(labelLeft, labelTop),
                 size = Size(textWidth, textHeight)
             )

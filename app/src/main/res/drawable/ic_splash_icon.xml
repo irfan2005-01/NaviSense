@@ -1,0 +1,28 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Deep Berry Eye Contour -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#69346C"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M 24,54 C 33,36 75,36 84,54 C 75,72 33,72 24,54 Z" />
+
+    <!-- Deep Berry Iris Circle -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#69346C"
+        android:strokeWidth="3"
+        android:pathData="M 54,54 m -15,0 a 15,15 0 1,0 30,0 a 15,15 0 1,0 -30,0" />
+
+    <!-- Deep Berry Navigation Pointer / Arrow inside Iris -->
+    <path
+        android:fillColor="#69346C"
+        android:strokeColor="#69346C"
+        android:strokeWidth="1.5"
+        android:pathData="M 54,43 L 62,60 L 54,56 L 46,60 Z" />
+</vector>

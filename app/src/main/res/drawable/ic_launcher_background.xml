@@ -4,18 +4,19 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+    <!-- Deep Berry Background -->
     <path
-        android:fillColor="#121212"
+        android:fillColor="#69346C"
         android:pathData="M0,0h108v108h-108z" />
-    <!-- Subtle concentric sonar / radar circles -->
+    <!-- Subtle concentric sonar / radar circles in translucent Vanilla Cloud -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#2200E5FF"
+        android:strokeColor="#26FFF8DF"
         android:strokeWidth="1.5"
         android:pathData="M54,54m-42,0a42,42 0 1,0 84,0a42,42 0 1,0 -84,0" />
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#1A00E5FF"
+        android:strokeColor="#1AFFF8DF"
         android:strokeWidth="1.2"
         android:pathData="M54,54m-28,0a28,28 0 1,0 56,0a28,28 0 1,0 -56,0" />
 </vector>
