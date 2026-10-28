@@ -2,10 +2,10 @@ package com.example.navisense
 
 import android.util.Log
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Tracks the last announced alert timestamp, distance, and avoidance advice for cooldown evaluation.
+ * Maintained for backwards compatibility.
  */
 data class LastAlertRecord(
     val timestamp: Long,
@@ -31,14 +31,15 @@ data class NavigationContext(
  * - Computes avoidance guidance ("Step left", "Step right", "Stop") for center obstacles <= 3 m
  * - Prevents advice contradicting upcoming turns within 10 m of a maneuver
  * - Prevents dual vibration collision: only one vibration source active per frame
- * - Enforces cooldowns and synchronized speech / haptics.
+ * - Enforces track-specific alert isolation and cooldowns with synchronized speech / haptics.
  */
 class DecisionEngine(
     private val voiceManager: VoiceNotifier,
     private val hapticManager: HapticNotifier,
     val tracker: ObstacleTracker = ObstacleTracker(),
     private val timeProvider: () -> Long = { System.currentTimeMillis() },
-    val avoidanceAdvisor: AvoidanceAdvisor = AvoidanceAdvisor()
+    val avoidanceAdvisor: AvoidanceAdvisor = AvoidanceAdvisor(),
+    val alertManager: ObstacleAlertManager = ObstacleAlertManager()
 ) {
 
     var isVoiceEnabled: Boolean = true
@@ -72,15 +73,13 @@ class DecisionEngine(
     var navigationContext: NavigationContext? = null
     var navigationContextProvider: (() -> NavigationContext?)? = null
 
-    // Tracks cooldown per (label, zone) -> last spoken timestamp & distance & advice
-    private val lastAlertMap = ConcurrentHashMap<Pair<String, Zone>, LastAlertRecord>()
-
     fun processDetections(
         detections: List<Detection>,
         frameWidthPx: Int = 0,
         frameHeightPx: Int = 0
     ) {
         if (!isEnabled) {
+            alertManager.clear()
             tracker.clear()
             hapticManager.clearContinuousCenterObstacle()
             return
@@ -88,14 +87,18 @@ class DecisionEngine(
 
         if (detections.isEmpty()) {
             tracker.update(emptyList(), frameWidthPx, frameHeightPx)
+            alertManager.pruneInactiveTracks(tracker.activeTrackIds)
             hapticManager.clearContinuousCenterObstacle()
             return
         }
 
-        // 1. Update ObstacleTracker
+        // 1. Update ObstacleTracker with instance-aware IoU and spatial matching
         val trackedObstacles = tracker.update(detections, frameWidthPx, frameHeightPx)
 
-        // 2. Filter whitelisted & alert-eligible obstacles (3 consecutive frames, distance <= maxAlertDistanceMeters)
+        // 2. Clean up alert state for expired tracks (prevents unbounded memory growth)
+        alertManager.pruneInactiveTracks(tracker.activeTrackIds)
+
+        // 3. Filter whitelisted & alert-eligible obstacles (3 consecutive frames, distance <= maxAlertDistanceMeters)
         val validObstacles = trackedObstacles.filter { tracked ->
             val normalizedLabel = tracked.label.trim().lowercase(Locale.US)
             val isWhitelisted = normalizedLabel in OBSTACLE_WHITELIST
@@ -118,37 +121,22 @@ class DecisionEngine(
             return
         }
 
-        // 3. Rank detections by danger score: closer = higher danger, CENTER weighted higher
+        // 4. Rank detections by danger score: closer = higher danger, CENTER weighted higher
         val ranked = validObstacles.sortedByDescending { calculateDangerScore(it) }
         val topCandidates = ranked.take(2)
         val now = timeProvider()
         var oneShotHapticFired = false
 
         for (obstacle in topCandidates) {
-            val key = Pair(obstacle.label.trim().lowercase(Locale.US), obstacle.zone)
-            val lastRecord = lastAlertMap[key]
+            val isVehicle = obstacle.label.trim().lowercase(Locale.US) in ObstacleTracker.VEHICLE_CLASSES
+            val isVeryClose = !obstacle.isUnreliableOrLarge && (
+                obstacle.smoothedDistanceMeters < CRITICAL_DISTANCE_THRESHOLD_METERS || (!isVehicle && obstacle.isLargeBox)
+            )
 
-            // Cooldown rule: repeat same (label, zone) only if distance changed by >= 1m, or after 8s
-            val shouldAnnounce = if (lastRecord == null) {
-                true
-            } else {
-                val distanceDiff = kotlin.math.abs(obstacle.smoothedDistanceMeters - lastRecord.distanceMeters)
-                val elapsed = now - lastRecord.timestamp
-                val distanceChanged = distanceDiff >= DISTANCE_CHANGE_THRESHOLD_METERS
-                val cooldownExpired = elapsed >= COOLDOWN_MS
-                distanceChanged || cooldownExpired
-            }
+            // Per-object alert management: check cooldown and state change for this specific track
+            val (shouldAnnounce, _) = alertManager.shouldAlert(obstacle, now, isVeryClose)
 
             if (shouldAnnounce) {
-                // If box is unreliable or large vehicle, do NOT trigger urgent interrupt.
-                // For people, animals, furniture and other whitelisted classes, a box taller than 80%
-                // of the frame height means the object is very close, so keep the urgent alert (interrupt = true)
-                // and the critical haptic pattern.
-                val isVehicle = obstacle.label.trim().lowercase(Locale.US) in ObstacleTracker.VEHICLE_CLASSES
-                val isVeryClose = !obstacle.isUnreliableOrLarge && (
-                    obstacle.smoothedDistanceMeters < CRITICAL_DISTANCE_THRESHOLD_METERS || (!isVehicle && obstacle.isLargeBox)
-                )
-
                 // Requirement 1 & 2: Trigger avoidance advice only when a CENTER obstacle on the whitelist
                 // is within 3 m (and not a vehicle large-box "unreliable" case).
                 val triggersAvoidance = obstacle.zone == Zone.CENTER &&
@@ -177,6 +165,7 @@ class DecisionEngine(
                 }
 
                 // Requirement 4: speak the direction only when the advice changes or on the first alert for that obstacle.
+                val lastRecord = alertManager.getRecord(obstacle.trackId)
                 val isFirstAlert = (lastRecord == null)
                 val adviceChanged = (lastRecord != null && currentAdvice != lastRecord.lastAdvice)
                 val includeAdvice = (isFirstAlert || adviceChanged) && currentAdvice != null
@@ -188,23 +177,11 @@ class DecisionEngine(
                     contradictsNav = contradictsNav
                 )
 
-                lastAlertMap[key] = LastAlertRecord(
-                    timestamp = now,
-                    distanceMeters = obstacle.smoothedDistanceMeters,
-                    lastAdvice = currentAdvice
-                )
-
-                Log.i(
-                    TAG,
-                    "DecisionEngine trigger -> \"$message\" | Zone: ${obstacle.zone} | Dist: ${String.format(Locale.US, "%.2f", obstacle.smoothedDistanceMeters)}m | Advice: $currentAdvice | Voice: $isVoiceEnabled | Haptics: $isHapticsEnabled | VeryClose: $isVeryClose | Unreliable: ${obstacle.isUnreliableOrLarge}"
-                )
-
-                if (isVoiceEnabled) {
-                    voiceManager.speak(message, interrupt = isVeryClose)
-                }
+                val alertPriority = if (isVeryClose) HapticPriority.CRITICAL else HapticPriority.NORMAL_OBSTACLE
 
                 // Requirement 6: Obstacle vibration is only for CENTER-zone obstacles within 3 m.
                 // LEFT and RIGHT obstacles produce no vibration (voice only). No vibration for direction advice.
+                var thisObstacleHapticFired = false
                 if (isHapticsEnabled && !oneShotHapticFired && obstacle.zone == Zone.CENTER && obstacle.smoothedDistanceMeters <= CONTINUOUS_HAPTIC_THRESHOLD_METERS) {
                     val hapticDist = if (!isVehicle && obstacle.isLargeBox) {
                         obstacle.smoothedDistanceMeters.coerceAtMost(CRITICAL_DISTANCE_THRESHOLD_METERS - 0.1f)
@@ -213,13 +190,33 @@ class DecisionEngine(
                     }
                     hapticManager.vibrateForObstacleAlert(hapticDist, obstacle.zone)
                     oneShotHapticFired = true
+                    thisObstacleHapticFired = true
+                }
+
+                alertManager.recordAlert(
+                    obstacle = obstacle,
+                    currentTimeMs = now,
+                    advice = currentAdvice,
+                    isUrgent = isVeryClose,
+                    priority = alertPriority,
+                    oneShotHapticFired = thisObstacleHapticFired,
+                    message = message
+                )
+
+                Log.i(
+                    TAG,
+                    "DecisionEngine trigger -> \"$message\" | Track: ${obstacle.trackId} | Zone: ${obstacle.zone} | Dist: ${String.format(Locale.US, "%.2f", obstacle.smoothedDistanceMeters)}m | Advice: $currentAdvice | Voice: $isVoiceEnabled | Haptics: $isHapticsEnabled | VeryClose: $isVeryClose | Unreliable: ${obstacle.isUnreliableOrLarge}"
+                )
+
+                if (isVoiceEnabled) {
+                    voiceManager.speak(message, interrupt = isVeryClose)
                 }
 
                 if (isVeryClose) break
             }
         }
 
-        // 4. Center obstacle cadenced haptics
+        // 5. Center obstacle cadenced haptics
         // Single vibration source - do NOT fire cadence if one-shot alert fired on this frame
         val closestCenterObstacle = validObstacles
             .filter { it.zone == Zone.CENTER && (it.smoothedDistanceMeters < CONTINUOUS_HAPTIC_THRESHOLD_METERS || (!it.isUnreliableOrLarge && it.isLargeBox)) }
@@ -321,7 +318,7 @@ class DecisionEngine(
     }
 
     fun clear() {
-        lastAlertMap.clear()
+        alertManager.clear()
         tracker.clear()
         hapticManager.clearContinuousCenterObstacle()
         hapticManager.cancel()
